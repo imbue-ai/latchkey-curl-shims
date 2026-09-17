@@ -67,7 +67,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          cargo_version="$(cargo metadata --manifest-path latchkey-curl-router/Cargo.toml --no-deps --format-version 1 | jq -r '.packages[0].version')"
           if [[ "${REF_NAME#v}" != "${cargo_version}" ]]; then
               echo "ERROR: tag ${REF_NAME} disagrees with Cargo.toml version ${cargo_version}" >&2
               exit 1
@@ -86,9 +86,11 @@ jobs:
               command -v "$tool" >/dev/null 2>&1 || brew install "$tool"
           done
 
-      # rustup reads rust-toolchain.toml; the musl legs also need the
-      # cross target, whose std ships a self-contained static libc.
+      # rustup reads latchkey-curl-router/rust-toolchain.toml; the musl
+      # legs also need the cross target, whose std ships a self-contained
+      # static libc.
       - name: Install the pinned Rust toolchain
+        working-directory: latchkey-curl-router
         env:
           TRIPLE: ${{ matrix.triple }}
         run: |
@@ -101,16 +103,17 @@ jobs:
 
       - name: Build the router
         id: router
+        working-directory: latchkey-curl-router
         env:
           TRIPLE: ${{ matrix.triple }}
         run: |
           set -euo pipefail
           if [[ "${TRIPLE}" == *-linux-musl ]]; then
               cargo build --release --locked --target "${TRIPLE}"
-              echo "bin=target/${TRIPLE}/release/latchkey-curl-router" >> "$GITHUB_OUTPUT"
+              echo "bin=latchkey-curl-router/target/${TRIPLE}/release/latchkey-curl-router" >> "$GITHUB_OUTPUT"
           else
               cargo build --release --locked
-              echo "bin=target/release/latchkey-curl-router" >> "$GITHUB_OUTPUT"
+              echo "bin=latchkey-curl-router/target/release/latchkey-curl-router" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Fetch upstream at the pinned commit

@@ -69,8 +69,9 @@ before the impersonation one: a proxied request keeps its
 ## Layout
 
 ```
-src/main.rs            latchkey-curl-router, with its unit tests
-tests/exec.rs          the exec path, against fake curl scripts
+latchkey-curl-router/  the router, a Cargo crate
+  src/main.rs          the program, with its unit tests
+  tests/exec.rs        the exec path, against fake curl scripts
 curl-impersonate/
   pin.env              the upstream tag and commit we build
   build.sh             upstream's CMake build plus our flags
@@ -81,6 +82,7 @@ curl-impersonate/
 ```
 
 ```sh
+cd latchkey-curl-router
 cargo test                     # the router's unit and exec tests
 cargo build --release          # target/release/latchkey-curl-router
 ```
@@ -169,7 +171,7 @@ When upstream tags a version with a newer `chromeNNN`:
    profile table in `lib/impersonate.c`.
 2. Edit `curl-impersonate/pin.env`: new `UPSTREAM_TAG` and
    `UPSTREAM_COMMIT`.
-3. Bump `DEFAULT_PROFILE` in `src/main.rs` if the point was a newer
+3. Bump `DEFAULT_PROFILE` in `latchkey-curl-router/src/main.rs` if the point was a newer
    Chrome, and the JA4 in `release.yml`'s smoke test: load
    `https://tls.browserleaks.com/json` in Chrome and compare with what
    `curl-impersonate --impersonate chromeNNN` gets from the

@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    working-directory: latchkey-curl-router
+
 jobs:
   test:
     name: test (${{ matrix.runs-on }})
