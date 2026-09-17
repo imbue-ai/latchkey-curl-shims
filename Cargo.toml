@@ -1,0 +1,15 @@
+[package]
+name = "latchkey-curl-router"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "A drop-in curl that routes marked requests to a Chrome-impersonating curl"
+repository = "https://github.com/imbue-ai/latchkey-curl-shims"
+publish = false
+
+[dependencies]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

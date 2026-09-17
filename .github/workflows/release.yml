@@ -1,0 +1,263 @@
+# Builds both shims for every supported triple and, on a `v*` tag,
+# publishes them as a GitHub release: one `latchkey-curl-shims-<triple>.tar.gz`
+# per triple holding `latchkey-curl-router`, `curl-impersonate`
+# and the license notices, plus a SHA256SUMS. A `workflow_dispatch` run
+# builds everything and uploads the tarballs as workflow artifacts
+# without publishing, for checking a change before tagging.
+#
+# Why curl-impersonate is built here rather than downloaded from
+# lexiforest's releases: the impersonating curl is the process latchkey
+# hands live session cookies to. Its source is small enough to read (two
+# patches over hash-pinned upstream curl and BoringSSL), but upstream
+# publishes no attestation linking its release binaries to that source.
+# Building here closes that gap: every byte we ship traces to the commit
+# in curl-impersonate/pin.env and a run whose log is ours. See README.md.
+#
+# The linux-musl legs build curl-impersonate inside an `alpine:3.21`
+# container via `docker run`, so the C compiler is a distro package
+# rather than a fetched cross toolchain. `docker run` rather than the
+# job-level `container:` because GitHub cannot run its JavaScript actions
+# (checkout, upload-artifact) inside an Alpine container on an arm64
+# runner. The router is built on the host with rustup's musl target,
+# which ships its own static libc.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # gh release create
+
+jobs:
+  build:
+    name: build (${{ matrix.triple }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: aarch64-apple-darwin
+            runs-on: macos-14
+          - triple: x86_64-apple-darwin
+            runs-on: macos-15-intel
+          - triple: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-latest
+          - triple: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-24.04-arm
+          - triple: x86_64-unknown-linux-musl
+            runs-on: ubuntu-latest
+          - triple: aarch64-unknown-linux-musl
+            runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Read the pin
+        id: pin
+        run: |
+          set -euo pipefail
+          grep -v '^#' curl-impersonate/pin.env >> "$GITHUB_OUTPUT"
+
+      - name: Check the tag against Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [[ "${REF_NAME#v}" != "${cargo_version}" ]]; then
+              echo "ERROR: tag ${REF_NAME} disagrees with Cargo.toml version ${cargo_version}" >&2
+              exit 1
+          fi
+
+      - name: Install build tools (ubuntu)
+        if: startsWith(matrix.runs-on, 'ubuntu') && endsWith(matrix.triple, '-gnu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build perl golang-go patch file
+
+      - name: Install build tools (macos)
+        if: startsWith(matrix.runs-on, 'macos')
+        run: |
+          for tool in cmake ninja go; do
+              command -v "$tool" >/dev/null 2>&1 || brew install "$tool"
+          done
+
+      # rustup reads rust-toolchain.toml; the musl legs also need the
+      # cross target, whose std ships a self-contained static libc.
+      - name: Install the pinned Rust toolchain
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          if [[ "${TRIPLE}" == *-linux-musl ]]; then
+              rustup target add "${TRIPLE}"
+          fi
+          cargo --version
+
+      - name: Build the router
+        id: router
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          if [[ "${TRIPLE}" == *-linux-musl ]]; then
+              cargo build --release --locked --target "${TRIPLE}"
+              echo "bin=target/${TRIPLE}/release/latchkey-curl-router" >> "$GITHUB_OUTPUT"
+          else
+              cargo build --release --locked
+              echo "bin=target/release/latchkey-curl-router" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch upstream at the pinned commit
+        env:
+          UPSTREAM_TAG: ${{ steps.pin.outputs.UPSTREAM_TAG }}
+          UPSTREAM_COMMIT: ${{ steps.pin.outputs.UPSTREAM_COMMIT }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${UPSTREAM_TAG}" https://github.com/lexiforest/curl-impersonate.git upstream
+          actual="$(git -C upstream rev-parse HEAD)"
+          if [[ "${actual}" != "${UPSTREAM_COMMIT}" ]]; then
+              echo "ERROR: tag ${UPSTREAM_TAG} resolves to ${actual}, pin.env says ${UPSTREAM_COMMIT}" >&2
+              exit 1
+          fi
+
+      - name: Build curl-impersonate
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          UPSTREAM_COMMIT: ${{ steps.pin.outputs.UPSTREAM_COMMIT }}
+          BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          case "${TRIPLE}" in
+              *-linux-musl)
+                  docker run --rm -v "${PWD}:/work" -w /work \
+                      -e UPSTREAM_COMMIT -e BUILD_URL \
+                      alpine:3.21 sh -c '
+                          set -e
+                          apk add --no-cache bash ninja cmake make patch linux-headers build-base perl go file tar >/dev/null
+                          curl-impersonate/build.sh "$0" upstream out
+                      ' "${TRIPLE}"
+                  ;;
+              *)
+                  curl-impersonate/build.sh "${TRIPLE}" upstream out
+                  ;;
+          esac
+
+      # The musl binaries are static, so this runs on the host for every
+      # leg. JA4 is order-independent (stable across handshakes); this is
+      # what a real Chromium presented when the pin was made.
+      - name: Smoke-test the fingerprint
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          bin="out/curl-impersonate-${TRIPLE}/curl-impersonate"
+          "${bin}" -sS --compressed --impersonate chrome150 https://tls.browserleaks.com/json > fp.json
+          cat fp.json
+          grep -q '"ja4": *"t13d1516h2_8daaf6152771_' fp.json
+
+      # Fully static means no PT_INTERP program header (nothing asks for
+      # a dynamic loader) and no DT_NEEDED entries (no shared-library
+      # dependencies). A static-pie binary keeps a DYNAMIC section for
+      # self-relocation, so `readelf -d` being non-empty is fine.
+      - name: Assert the musl binaries are fully static
+        if: endsWith(matrix.triple, '-musl')
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          ROUTER: ${{ steps.router.outputs.bin }}
+        run: |
+          set -euo pipefail
+          for bin in "${ROUTER}" "out/curl-impersonate-${TRIPLE}/curl-impersonate"; do
+              echo "--- ${bin}"
+              file -L "${bin}"
+              if readelf -l "${bin}" | grep -q 'INTERP'; then
+                  echo "ERROR: ${bin} requests a dynamic loader (PT_INTERP)" >&2
+                  exit 1
+              fi
+              if readelf -d "${bin}" 2>/dev/null | grep -q 'NEEDED'; then
+                  echo "ERROR: ${bin} has DT_NEEDED shared-library deps" >&2
+                  readelf -d "${bin}" | grep 'NEEDED' >&2
+                  exit 1
+              fi
+          done
+
+      # The two public names are what consumers resolve by: the router
+      # finds the impersonator as its `curl-impersonate` sibling, and
+      # whatever installs the tarball looks for the router by its name.
+      - name: Stage the tarball
+        env:
+          TRIPLE: ${{ matrix.triple }}
+          ROUTER: ${{ steps.router.outputs.bin }}
+        run: |
+          set -euo pipefail
+          stage="latchkey-curl-shims-${TRIPLE}"
+          mkdir -p "${stage}"
+          cp "${ROUTER}" "${stage}/latchkey-curl-router"
+          cp "out/curl-impersonate-${TRIPLE}/curl-impersonate" "${stage}/curl-impersonate"
+          cp "out/curl-impersonate-${TRIPLE}"/LICENSE-* "out/curl-impersonate-${TRIPLE}/SOURCE" "${stage}/"
+          chmod +x "${stage}/latchkey-curl-router" "${stage}/curl-impersonate"
+          "${stage}/curl-impersonate" --version
+          tar -czf "${stage}.tar.gz" "${stage}"
+          ls -l "${stage}.tar.gz"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: latchkey-curl-shims-${{ matrix.triple }}
+          path: latchkey-curl-shims-${{ matrix.triple }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Read the pin
+        id: pin
+        run: |
+          set -euo pipefail
+          grep -v '^#' curl-impersonate/pin.env >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      # A tag that already has a release fails here rather than
+      # overwriting bytes some consumer may already pin by sha256.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          UPSTREAM_TAG: ${{ steps.pin.outputs.UPSTREAM_TAG }}
+          UPSTREAM_COMMIT: ${{ steps.pin.outputs.UPSTREAM_COMMIT }}
+        run: |
+          set -euo pipefail
+          if gh release view "${REF_NAME}" >/dev/null 2>&1; then
+              echo "ERROR: release ${REF_NAME} already exists" >&2
+              exit 1
+          fi
+          cd assets
+          sha256sum latchkey-curl-shims-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          notes="$(cat <<EOF
+          \`latchkey-curl-router\` at \`${GITHUB_SHA}\` and \`curl-impersonate\` built from source at [lexiforest/curl-impersonate ${UPSTREAM_TAG}](https://github.com/lexiforest/curl-impersonate/tree/${UPSTREAM_COMMIT}) (\`${UPSTREAM_COMMIT}\`), by run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}.
+
+          \`\`\`
+          $(cat SHA256SUMS)
+          \`\`\`
+          EOF
+          )"
+          gh release create "${REF_NAME}" \
+              --verify-tag \
+              --title "${REF_NAME}" \
+              --notes "${notes}" \
+              latchkey-curl-shims-*.tar.gz SHA256SUMS

@@ -1,0 +1,6 @@
+# The compiler every release binary is built with. CI installs it through
+# rustup; a cargo without rustup ignores this file.
+[toolchain]
+channel = "1.98.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
