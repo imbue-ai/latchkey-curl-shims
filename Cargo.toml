@@ -8,6 +8,7 @@ repository = "https://github.com/imbue-ai/latchkey-curl-shims"
 publish = false
 
 [dependencies]
+serde_json = "1"
 
 [profile.release]
 strip = true

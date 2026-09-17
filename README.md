@@ -7,7 +7,7 @@ expects:
 
 | binary | what it is |
 |---|---|
-| `latchkey-curl-router` | The `curl` that `LATCHKEY_CURL` points at. A small std-only Rust program: an invocation carrying the private `X-Imbue-Impersonate` header is rewritten (that header and any `User-Agent` dropped, `--compressed --noproxy '*' --impersonate <profile>` put in front) and handed to the impersonating curl next to it. An invocation carrying `X-Imbue-Desktop-Proxy` is rewritten onto the latchkey gateway on the user's own computer. Anything else goes to the system `curl` untouched. |
+| `latchkey-curl-router` | The `curl` that `LATCHKEY_CURL` points at. A small Rust program: an invocation whose URL matches the desktop-proxy config (below) is rewritten onto the latchkey gateway on the user's own computer. Otherwise, an invocation carrying the private `X-Imbue-Impersonate` header is rewritten (that header and any `User-Agent` dropped, `--compressed --noproxy '*' --impersonate <profile>` put in front) and handed to the impersonating curl next to it. Anything else goes to the system `curl` untouched. |
 | `curl-impersonate` | Upstream [curl-impersonate](https://github.com/lexiforest/curl-impersonate), unmodified: a curl with a patched BoringSSL and a built-in `--impersonate <browser>` flag that presents Chrome's TLS and HTTP/2 fingerprint. **On its own it does not impersonate**: without `--impersonate` it is a plain curl 8.x and gets the same `403` a stock curl does. The router is what adds the flag. |
 
 Some of the hosts datalib mirrors, `claude.ai` and `chatgpt.com` today,
@@ -31,6 +31,40 @@ The `--impersonate` target is `DATALIB_IMPERSONATE_PROFILE`, default
 `chrome150`. It is passed through as-is; a name curl-impersonate does
 not know fails the request with exit 43 and a message naming a valid
 one.
+
+## The desktop proxy
+
+A request can be made to leave from the user's own computer instead of
+the machine the router runs on: the router hands it to the system curl,
+addressed to the `/gateway/<url>` endpoint of the latchkey gateway on
+that computer, with everything else in the invocation kept as it was.
+Which requests get this is a JSON file, and three environment variables
+say where things are:
+
+| variable | meaning |
+|---|---|
+| `LATCHKEY_DESKTOP_PROXY_CONFIG` | Path of the config file. Unset or empty: nothing is proxied. Set but missing, unreadable or not a JSON object: every invocation fails with exit 2, since routing was asked for and is not happening. |
+| `LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL` | Base URL of the desktop gateway as reachable from this machine. Required once a request matches. |
+| `LATCHKEY_GATEWAY_LISTEN_PASSWORD` | The gateway's shared password, sent as `X-Latchkey-Gateway-Password`. Optional. |
+
+The file holds one object. Each key is a base URL and each value is
+anything; a request is proxied when its URL starts with a key whose
+value is truthy in the JavaScript sense (not `false`, `0`, `""` or
+`null`). The prefix test is exactly latchkey's own `baseApiUrls` match,
+`url.startsWith(baseApiUrl)`, with no normalization on either side, so
+a base URL that works for `latchkey services register` works here.
+
+```json
+{
+  "https://slack.com/api/": true,
+  "https://api.github.com/": false
+}
+```
+
+The request URL is the last argument of the invocation, which is where
+`latchkey curl` and the gateway both put it. The proxy decision comes
+before the impersonation one: a proxied request keeps its
+`X-Imbue-Impersonate` header for the desktop gateway's own router.
 
 ## Layout
 

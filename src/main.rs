@@ -1,8 +1,10 @@
 //! `latchkey-curl-router` — a drop-in `curl` that routes each
 //! invocation to one of two real implementations, and optionally to a
-//! different destination, based on private signatures in the arguments.
-//! It exists so a single `LATCHKEY_CURL` binary can serve impersonating
-//! and non-impersonating callers alike without breaking the latter: only
+//! different destination. Impersonation is asked for by a private marker
+//! header in the arguments; the desktop proxy is chosen by matching the
+//! request URL against a config file named in the environment. It exists
+//! so a single `LATCHKEY_CURL` binary can serve impersonating and
+//! non-impersonating callers alike without breaking the latter: only
 //! callers that opt in get the Chrome-impersonating curl; everyone else
 //! keeps getting the system curl they expect.
 //!
@@ -16,25 +18,32 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde_json::Value;
+
 /// Name of the private routing marker header. Namespaced so it can't
 /// collide with a header a caller legitimately wants to set or strip.
 const MARKER_HEADER_NAME: &str = "X-Imbue-Impersonate";
 
-/// Name of the private marker header asking for the request to leave from
-/// the user's own computer rather than from this machine. minds publishes
-/// this name to remote workspaces as `MINDS_DESKTOP_PROXY_HEADER`, which
-/// datalib's `http.rs` attaches as-is; this is the one place the name is
-/// spelled out. Matched by name like [`MARKER_HEADER_NAME`], for the same reason.
-const DESKTOP_PROXY_MARKER_HEADER_NAME: &str = "X-Imbue-Desktop-Proxy";
+/// Env var naming the JSON file that says which requests leave from the
+/// user's own computer rather than from this machine. The file holds one
+/// object; each key is a base URL and a request whose URL starts with a
+/// key whose value is truthy (in the JavaScript sense: not `false`, `0`,
+/// `""` or `null`) is routed through the desktop proxy. The prefix test is
+/// latchkey's own `baseApiUrls` match (`url.startsWith(baseApiUrl)`, no
+/// normalization on either side), so a base URL that works in `latchkey
+/// services register` works here. Unset or empty: nothing is proxied. Set
+/// but unreadable or malformed: an error, since the operator asked for
+/// routing they are not getting.
+const DESKTOP_PROXY_CONFIG_ENV: &str = "LATCHKEY_DESKTOP_PROXY_CONFIG";
 
 /// Env var holding the base URL of the latchkey gateway on the user's
 /// computer, as reachable from this machine (in minds, a reverse tunnel
 /// into the VPS loopback). It is the variable minds already gives the
 /// VPS gateway for its own desktop-forwarding extension; the gateway
 /// runs us as a child, so we inherit it rather than needing one of our
-/// own. Required whenever a request carries the desktop-proxy marker; a
-/// marked request with no gateway to send it to is an error, not a
-/// silent direct request, since the caller asked for a different source
+/// own. Required whenever a request matches the desktop-proxy config; a
+/// matched request with no gateway to send it to is an error, not a
+/// silent direct request, since the operator asked for a different source
 /// address on purpose.
 const DESKTOP_PROXY_GATEWAY_URL_ENV: &str = "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL";
 
@@ -116,6 +125,69 @@ fn has_header(argv: &[String], name: &str) -> bool {
     false
 }
 
+/// The base URLs whose requests go through the desktop proxy: the keys of
+/// the config file with a truthy value.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DesktopProxyRules {
+    base_urls: Vec<String>,
+}
+
+impl DesktopProxyRules {
+    /// `None` when the env var is unset or empty; an error when it names
+    /// a file that cannot be read or is not a JSON object.
+    fn from_env() -> Result<Option<Self>, String> {
+        let path = match std::env::var(DESKTOP_PROXY_CONFIG_ENV) {
+            Ok(value) if !value.is_empty() => value,
+            _ => return Ok(None),
+        };
+        let text = std::fs::read_to_string(&path)
+            .map_err(|err| format!("cannot read {DESKTOP_PROXY_CONFIG_ENV}={path}: {err}"))?;
+        Self::parse(&text)
+            .map(Some)
+            .map_err(|err| format!("{DESKTOP_PROXY_CONFIG_ENV}={path}: {err}"))
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        let value: Value = serde_json::from_str(text).map_err(|err| format!("not JSON: {err}"))?;
+        let Value::Object(entries) = value else {
+            return Err("expected a JSON object with base URLs as keys".to_string());
+        };
+        Ok(Self {
+            base_urls: entries
+                .into_iter()
+                .filter(|(_, value)| is_truthy(value))
+                .map(|(base_url, _)| base_url)
+                .collect(),
+        })
+    }
+
+    fn matches(&self, url: &str) -> bool {
+        self.base_urls
+            .iter()
+            .any(|base_url| url.starts_with(base_url.as_str()))
+    }
+}
+
+/// JavaScript's truthiness, since the values are whatever a JavaScript
+/// writer put there. An empty array or object is truthy, as in JS.
+fn is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+/// The URL a curl invocation is for: its last argument, when that is an
+/// absolute http(s) URL. This is the shape every caller of ours produces
+/// (latchkey's gateway and `latchkey curl` both put the URL last).
+fn request_url(argv: &[String]) -> Option<&str> {
+    let last = argv.last()?;
+    (last.starts_with("http://") || last.starts_with("https://")).then_some(last.as_str())
+}
+
 /// Where an invocation goes; see the module docs for the order.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
@@ -128,11 +200,13 @@ enum Route {
     SystemCurl,
 }
 
-fn choose_route(argv: &[String]) -> Route {
-    // The desktop-proxy marker is checked first: an invocation carrying
-    // both markers must keep its impersonation marker for the desktop
-    // gateway's curl, which the impersonator here would strip.
-    if has_header(argv, DESKTOP_PROXY_MARKER_HEADER_NAME) {
+fn choose_route(argv: &[String], desktop_proxy: Option<&DesktopProxyRules>) -> Route {
+    // The desktop proxy is decided first: a request that also carries the
+    // impersonation marker must keep it for the desktop gateway's own
+    // curl, which the impersonator here would strip.
+    let proxied =
+        request_url(argv).is_some_and(|url| desktop_proxy.is_some_and(|rules| rules.matches(url)));
+    if proxied {
         Route::DesktopProxy
     } else if has_header(argv, MARKER_HEADER_NAME) {
         Route::Impersonate
@@ -141,7 +215,7 @@ fn choose_route(argv: &[String]) -> Route {
     }
 }
 
-/// The desktop latchkey gateway a marked request is sent to, read from
+/// The desktop latchkey gateway a matched request is sent to, read from
 /// the environment inherited from the gateway that runs us.
 struct DesktopGateway {
     /// Base URL without a trailing slash, so the endpoint path can be
@@ -156,7 +230,7 @@ impl DesktopGateway {
             Ok(value) if !value.is_empty() => value,
             _ => {
                 return Err(format!(
-                    "desktop proxy requested ({DESKTOP_PROXY_MARKER_HEADER_NAME} header) but \
+                    "request matches {DESKTOP_PROXY_CONFIG_ENV} but \
                      {DESKTOP_PROXY_GATEWAY_URL_ENV} is not set"
                 ))
             }
@@ -171,20 +245,20 @@ impl DesktopGateway {
     }
 }
 
-/// Rewrite a marked invocation so it goes to the desktop gateway's
-/// outbound proxy instead of straight to the third party.
+/// Rewrite a matched invocation so it goes to the desktop gateway's
+/// outbound proxy instead of straight to the third party. Everything but
+/// the URL is kept verbatim, in order: the impersonation marker and the
+/// caller's credentials are for the desktop gateway to handle.
 fn rewrite_for_desktop_proxy(
     argv: &[String],
     gateway: &DesktopGateway,
 ) -> Result<Vec<String>, String> {
-    let Some(target_url) = argv.last() else {
-        return Err("desktop proxy requested but the invocation has no arguments".to_string());
-    };
-    if !target_url.starts_with("http://") && !target_url.starts_with("https://") {
+    let Some(target_url) = request_url(argv) else {
         return Err(format!(
-            "desktop proxy requested but the last argument is not an absolute http(s) URL: {target_url:?}"
+            "desktop proxy requested but the last argument is not an absolute http(s) URL: {:?}",
+            argv.last()
         ));
-    }
+    };
 
     let mut rewritten = Vec::with_capacity(argv.len() + 4);
     rewritten.push("-H".to_string());
@@ -193,26 +267,7 @@ fn rewrite_for_desktop_proxy(
         rewritten.push("-H".to_string());
         rewritten.push(format!("{GATEWAY_PASSWORD_HEADER_NAME}: {password}"));
     }
-
-    let body = &argv[..argv.len() - 1];
-    let mut it = body.iter().peekable();
-    while let Some(tok) = it.next() {
-        if is_header_flag(tok) {
-            // A header's value belongs to it: copy or drop the pair as a
-            // unit, so a value that looks like a flag is never re-read.
-            match it.next() {
-                Some(value) if is_header_named(value, DESKTOP_PROXY_MARKER_HEADER_NAME) => continue,
-                Some(value) => {
-                    rewritten.push(tok.clone());
-                    rewritten.push(value.clone());
-                }
-                None => rewritten.push(tok.clone()),
-            }
-        } else {
-            rewritten.push(tok.clone());
-        }
-    }
-
+    rewritten.extend_from_slice(&argv[..argv.len() - 1]);
     rewritten.push(format!(
         "{}{GATEWAY_PATH_PREFIX}{target_url}",
         gateway.base_url
@@ -314,7 +369,8 @@ fn main() {
         .ok()
         .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
 
-    let target = match choose_route(&argv) {
+    let desktop_proxy = DesktopProxyRules::from_env().unwrap_or_else(|message| die(message));
+    let target = match choose_route(&argv, desktop_proxy.as_ref()) {
         Route::DesktopProxy => {
             let gateway = DesktopGateway::from_env().unwrap_or_else(|message| die(message));
             argv =
@@ -444,7 +500,13 @@ mod tests {
         }
     }
 
-    fn marked_gateway_invocation() -> Vec<String> {
+    fn rules(base_urls: &[&str]) -> DesktopProxyRules {
+        DesktopProxyRules {
+            base_urls: base_urls.iter().map(|u| u.to_string()).collect(),
+        }
+    }
+
+    fn gateway_invocation() -> Vec<String> {
         argv(&[
             "-sS",
             "-D",
@@ -456,8 +518,6 @@ mod tests {
             "-H",
             "X-Imbue-Impersonate: 1",
             "-H",
-            "X-Imbue-Desktop-Proxy: 1",
-            "-H",
             "Authorization: Bearer injected-on-the-vps",
             "--data-binary",
             "@-",
@@ -465,57 +525,142 @@ mod tests {
         ])
     }
 
-    /// The desktop-proxy marker wins over the impersonation marker, so
-    /// the latter reaches the desktop gateway's own curl intact.
+    /// Only a key with a truthy value is a rule; truthiness is
+    /// JavaScript's, since the file is written by JavaScript.
     #[test]
-    fn desktop_proxy_marker_decides_the_route_before_impersonation() {
+    fn config_keeps_the_keys_with_truthy_values() {
+        let parsed = DesktopProxyRules::parse(
+            r#"{
+                "https://slack.com/api/": true,
+                "https://api.github.com/": 1,
+                "https://gitlab.com/api/": "yes",
+                "https://example.com/a/": [],
+                "https://example.com/b/": {},
+                "https://example.com/c/": 0.5,
+                "https://off.example.com/false/": false,
+                "https://off.example.com/zero/": 0,
+                "https://off.example.com/float-zero/": 0.0,
+                "https://off.example.com/empty/": "",
+                "https://off.example.com/null/": null
+            }"#,
+        )
+        .expect("parses");
         assert_eq!(
-            choose_route(&marked_gateway_invocation()),
+            parsed,
+            rules(&[
+                "https://api.github.com/",
+                "https://example.com/a/",
+                "https://example.com/b/",
+                "https://example.com/c/",
+                "https://gitlab.com/api/",
+                "https://slack.com/api/",
+            ])
+        );
+    }
+
+    #[test]
+    fn config_that_is_not_an_object_is_an_error() {
+        for text in ["[]", "\"https://slack.com/\"", "null", "true", "{", ""] {
+            assert!(
+                DesktopProxyRules::parse(text).is_err(),
+                "unexpectedly parsed {text:?}"
+            );
+        }
+        assert_eq!(DesktopProxyRules::parse("{}").unwrap(), rules(&[]));
+    }
+
+    /// The match is latchkey's `url.startsWith(baseApiUrl)`: a plain
+    /// prefix on the raw strings, nothing normalized.
+    #[test]
+    fn matching_is_a_plain_prefix_test_like_latchkey() {
+        let rules = rules(&["https://api.calendly.com/", "http://a.example.com"]);
+        for url in [
+            "https://api.calendly.com/",
+            "https://api.calendly.com/users/me",
+            "https://api.calendly.com/x?y=https://other.example.com/",
+            "http://a.example.com",
+            "http://a.example.com/path",
+            "http://a.example.com.evil.com/",
+        ] {
+            assert!(rules.matches(url), "{url:?} should match");
+        }
+        for url in [
+            "https://api.calendly.com",
+            "https://API.calendly.com/users/me",
+            "http://api.calendly.com/users/me",
+            "https://www.api.calendly.com/",
+            "https://a.example.com",
+            "https://evil.com/?u=https://api.calendly.com/",
+        ] {
+            assert!(!rules.matches(url), "{url:?} should not match");
+        }
+    }
+
+    /// A matched request goes to the desktop proxy even when it also
+    /// carries the impersonation marker, so the marker reaches the
+    /// desktop gateway's own curl intact.
+    #[test]
+    fn desktop_proxy_is_decided_before_impersonation() {
+        let slack = rules(&["https://slack.com/api/"]);
+        assert_eq!(
+            choose_route(&gateway_invocation(), Some(&slack)),
             Route::DesktopProxy
         );
         assert_eq!(
-            choose_route(&argv(&[
-                "-H",
-                "X-Imbue-Impersonate: 1",
-                "https://example.com/"
-            ])),
+            choose_route(&gateway_invocation(), None),
             Route::Impersonate
         );
         assert_eq!(
-            choose_route(&argv(&["-H", "Accept: */*", "https://example.com/"])),
+            choose_route(&gateway_invocation(), Some(&rules(&["https://claude.ai/"]))),
+            Route::Impersonate
+        );
+        assert_eq!(
+            choose_route(
+                &argv(&["-H", "Accept: */*", "https://slack.com/api/users.list"]),
+                Some(&slack)
+            ),
+            Route::DesktopProxy
+        );
+        assert_eq!(
+            choose_route(
+                &argv(&["-H", "Accept: */*", "https://example.com/"]),
+                Some(&slack)
+            ),
             Route::SystemCurl
         );
     }
 
+    /// Only the last argument is the request URL; a rule never matches
+    /// a URL that appears elsewhere, and an invocation without a URL
+    /// (`curl --version`) is not proxied.
     #[test]
-    fn desktop_proxy_marker_is_matched_by_name_whatever_its_value() {
-        for marker in [
-            "X-Imbue-Desktop-Proxy: 1",
-            "x-imbue-desktop-proxy: 1",
-            "X-Imbue-Desktop-Proxy:",
-            "X-Imbue-Desktop-Proxy;",
+    fn only_the_last_argument_is_matched() {
+        let slack = rules(&["https://slack.com/api/"]);
+        for tokens in [
+            argv(&["--version"]),
+            argv(&[]),
+            argv(&["https://slack.com/api/users.list", "-H"]),
+            argv(&[
+                "-H",
+                "Referer: https://slack.com/api/",
+                "https://example.com/",
+            ]),
+            argv(&["-o", "https://slack.com/api/users.list"]),
         ] {
-            let tokens = argv(&["-H", marker, "https://example.com/"]);
-            assert_eq!(
-                choose_route(&tokens),
-                Route::DesktopProxy,
-                "not recognized: {marker:?}"
-            );
+            let expected =
+                if tokens.last().map(String::as_str) == Some("https://slack.com/api/users.list") {
+                    Route::DesktopProxy
+                } else {
+                    Route::SystemCurl
+                };
+            assert_eq!(choose_route(&tokens, Some(&slack)), expected, "{tokens:?}");
         }
-        // A value that merely looks like the marker is not one.
-        let tokens = argv(&[
-            "-H",
-            "X-Echo: -H",
-            "X-Imbue-Desktop-Proxy: 1",
-            "https://example.com/",
-        ]);
-        assert_eq!(choose_route(&tokens), Route::SystemCurl);
     }
 
     #[test]
-    fn rewrites_a_marked_invocation_onto_the_desktop_gateway() {
+    fn rewrites_a_matched_invocation_onto_the_desktop_gateway() {
         let rewritten =
-            rewrite_for_desktop_proxy(&marked_gateway_invocation(), &test_gateway(Some("hunter2")))
+            rewrite_for_desktop_proxy(&gateway_invocation(), &test_gateway(Some("hunter2")))
                 .expect("rewrite succeeds");
         assert_eq!(
             rewritten,
@@ -544,11 +689,9 @@ mod tests {
 
     #[test]
     fn desktop_proxy_rewrite_sends_no_password_header_when_none_is_configured() {
-        let rewritten = rewrite_for_desktop_proxy(
-            &argv(&["-H", "X-Imbue-Desktop-Proxy: 1", "https://example.com/x"]),
-            &test_gateway(None),
-        )
-        .expect("rewrite succeeds");
+        let rewritten =
+            rewrite_for_desktop_proxy(&argv(&["https://example.com/x"]), &test_gateway(None))
+                .expect("rewrite succeeds");
         assert_eq!(
             rewritten,
             argv(&[
@@ -569,43 +712,13 @@ mod tests {
             "https://a.example.com/x?q=https://b.example.com/y",
             "http://a.example.com/a/../b",
         ] {
-            let rewritten = rewrite_for_desktop_proxy(
-                &argv(&["-H", "X-Imbue-Desktop-Proxy: 1", url]),
-                &test_gateway(None),
-            )
-            .expect("rewrite succeeds");
+            let rewritten = rewrite_for_desktop_proxy(&argv(&[url]), &test_gateway(None))
+                .expect("rewrite succeeds");
             assert_eq!(
                 rewritten.last().map(String::as_str),
                 Some(format!("http://127.0.0.1:1988/gateway/{url}").as_str())
             );
         }
-    }
-
-    /// A header whose value happens to look like a flag is copied as a
-    /// unit, never re-read as one.
-    #[test]
-    fn desktop_proxy_rewrite_copies_header_pairs_as_units() {
-        let rewritten = rewrite_for_desktop_proxy(
-            &argv(&[
-                "-H",
-                "X-Echo: -H",
-                "-H",
-                "X-Imbue-Desktop-Proxy: 1",
-                "https://example.com/x",
-            ]),
-            &test_gateway(None),
-        )
-        .expect("rewrite succeeds");
-        assert_eq!(
-            rewritten,
-            argv(&[
-                "-H",
-                "X-Latchkey-Gateway-No-Credentials: 1",
-                "-H",
-                "X-Echo: -H",
-                "http://127.0.0.1:1988/gateway/https://example.com/x",
-            ])
-        );
     }
 
     /// The shape the latchkey gateway hands us — its client's
@@ -746,9 +859,9 @@ mod tests {
     fn desktop_proxy_rewrite_refuses_an_invocation_that_does_not_end_in_a_url() {
         for tokens in [
             argv(&[]),
-            argv(&["-H", "X-Imbue-Desktop-Proxy: 1"]),
-            argv(&["https://example.com/x", "-H", "X-Imbue-Desktop-Proxy: 1"]),
-            argv(&["-H", "X-Imbue-Desktop-Proxy: 1", "ftp://example.com/x"]),
+            argv(&["-H", "Accept: */*"]),
+            argv(&["https://example.com/x", "-H", "Accept: */*"]),
+            argv(&["ftp://example.com/x"]),
         ] {
             let result = rewrite_for_desktop_proxy(&tokens, &test_gateway(None));
             assert!(result.is_err(), "unexpectedly rewrote {tokens:?}");
