@@ -38,14 +38,30 @@ A request can be made to leave from the user's own computer instead of
 the machine the router runs on: the router hands it to the system curl,
 addressed to the `/gateway/<url>` endpoint of the latchkey gateway on
 that computer, with everything else in the invocation kept as it was.
-Which requests get this is a JSON file, and three environment variables
+Which requests get this is a JSON file, and four environment variables
 say where things are:
 
 | variable | meaning |
 |---|---|
 | `LATCHKEY_DESKTOP_PROXY_CONFIG` | Path of the config file. Unset or empty: nothing is proxied. Set but missing, unreadable or not a JSON object: every invocation fails with exit 2, since routing was asked for and is not happening. |
 | `LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL` | Base URL of the desktop gateway as reachable from this machine. Required once a request matches. |
-| `LATCHKEY_GATEWAY_LISTEN_PASSWORD` | The gateway's shared password, sent as `X-Latchkey-Gateway-Password`. Optional. |
+| `LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE` | Path of a file holding the desktop gateway's listen password, sent as `X-Latchkey-Gateway-Password`. Unset or empty: no password is sent. Set but unreadable or empty: exit 2. |
+| `LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE` | Path of a file holding a permissions-override JWT, sent as `X-Latchkey-Gateway-Permissions-Override`, so the desktop gateway checks the request against the permissions file the JWT names instead of its default one. Same unset and unreadable handling as the password file. |
+
+All but the first are the variables minds already gives the VPS gateway
+for its desktop-forwarding extension; the gateway runs the router as a
+child, so the router inherits them. The secrets are files read on every
+invocation because they belong to whichever of the user's computers is
+connected, and change when the user moves to another one. The password
+the VPS gateway itself listens with (`LATCHKEY_GATEWAY_LISTEN_PASSWORD`)
+is a different one and is not used.
+
+The request is sent with `X-Latchkey-Gateway-No-Credentials: 1`. The
+desktop gateway then injects nothing, since the gateway that ran the
+router already did, but it still runs its permission check, and it
+refuses the header with a `403` unless it runs with
+`LATCHKEY_PASSTHROUGH_UNKNOWN`. Its check sees no `account` metadata, so
+a rule allowing these requests cannot be an account-scoped one.
 
 The file holds one object. Each key is a base URL and each value is
 anything; a request is proxied when its URL starts with a key whose
