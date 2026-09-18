@@ -1,8 +1,9 @@
 //! `latchkey-curl-router` — a drop-in `curl` that routes each
 //! invocation to one of two real implementations, and optionally to a
 //! different destination. Impersonation is asked for by a private marker
-//! header in the arguments; the desktop proxy is chosen by matching the
-//! request URL against a config file named in the environment. It exists
+//! header in the arguments; the desktop proxy is chosen by looking up the
+//! service latchkey matched the request to, which it reports in another
+//! header, in a config file named in the environment. It exists
 //! so a single `LATCHKEY_CURL` binary can serve impersonating and
 //! non-impersonating callers alike without breaking the latter: only
 //! callers that opt in get the Chrome-impersonating curl; everyone else
@@ -26,15 +27,21 @@ const MARKER_HEADER_NAME: &str = "X-Imbue-Impersonate";
 
 /// Env var naming the JSON file that says which requests leave from the
 /// user's own computer rather than from this machine. The file holds one
-/// object; each key is a base URL and a request whose URL starts with a
-/// key whose value is truthy (in the JavaScript sense: not `false`, `0`,
-/// `""` or `null`) is routed through the desktop proxy. The prefix test is
-/// latchkey's own `baseApiUrls` match (`url.startsWith(baseApiUrl)`, no
-/// normalization on either side), so a base URL that works in `latchkey
-/// services register` works here. Unset or empty: nothing is proxied. Set
-/// but unreadable or malformed: an error, since the operator asked for
-/// routing they are not getting.
+/// object; each key is a latchkey service name, and a request latchkey
+/// matched to a service whose value is truthy (in the JavaScript sense: not
+/// `false`, `0`, `""` or `null`) is routed through the desktop proxy. Unset
+/// or empty: nothing is proxied. Set but unreadable or malformed: an error,
+/// since the operator asked for routing they are not getting.
 const DESKTOP_PROXY_CONFIG_ENV: &str = "LATCHKEY_DESKTOP_PROXY_CONFIG";
+
+/// The header latchkey reports the matched service in, when it runs with
+/// `LATCHKEY_DIAGNOSTIC_HEADERS=1`. Latchkey decides which service a URL
+/// belongs to (by prefix or by pattern), so we take its answer rather than
+/// matching URLs a second time. Latchkey puts its header ahead of the
+/// caller's arguments and leaves a copy the caller supplied in place, so the
+/// first occurrence is the one read. The header is for us alone: every
+/// occurrence is dropped before curl runs.
+const MATCHED_SERVICE_HEADER_NAME: &str = "X-Latchkey-Matched-Service";
 
 /// Env var holding the base URL of the latchkey gateway on the user's
 /// computer, as reachable from this machine (in minds, a reverse tunnel
@@ -140,11 +147,53 @@ fn has_header(argv: &[String], name: &str) -> bool {
     false
 }
 
-/// The base URLs whose requests go through the desktop proxy: the keys of
-/// the config file with a truthy value.
+/// The value of the first header called `name`, trimmed. Empty for the
+/// value-less `name;` spelling.
+fn header_value<'a>(argv: &'a [String], name: &str) -> Option<&'a str> {
+    let mut it = argv.iter();
+    while let Some(tok) = it.next() {
+        if !is_header_flag(tok) {
+            continue;
+        }
+        let Some(header_argument) = it.next() else {
+            break;
+        };
+        if is_header_named(header_argument, name) {
+            let separator = header_argument.find([':', ';'])?;
+            return Some(header_argument[separator + 1..].trim());
+        }
+    }
+    None
+}
+
+/// `argv` without the headers called any of `names`.
+fn without_headers(argv: &[String], names: &[&str]) -> Vec<String> {
+    let mut kept = Vec::with_capacity(argv.len());
+    let mut it = argv.iter();
+    while let Some(tok) = it.next() {
+        if is_header_flag(tok) {
+            // A header's value belongs to it: keep or drop the pair as a
+            // unit, so a value that looks like a flag is never re-read.
+            match it.next() {
+                Some(value) if names.iter().any(|name| is_header_named(value, name)) => continue,
+                Some(value) => {
+                    kept.push(tok.clone());
+                    kept.push(value.clone());
+                }
+                None => kept.push(tok.clone()),
+            }
+        } else {
+            kept.push(tok.clone());
+        }
+    }
+    kept
+}
+
+/// The latchkey services whose requests go through the desktop proxy: the
+/// keys of the config file with a truthy value.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DesktopProxyRules {
-    base_urls: Vec<String>,
+    service_names: Vec<String>,
 }
 
 impl DesktopProxyRules {
@@ -165,21 +214,19 @@ impl DesktopProxyRules {
     fn parse(text: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(text).map_err(|err| format!("not JSON: {err}"))?;
         let Value::Object(entries) = value else {
-            return Err("expected a JSON object with base URLs as keys".to_string());
+            return Err("expected a JSON object with latchkey service names as keys".to_string());
         };
         Ok(Self {
-            base_urls: entries
+            service_names: entries
                 .into_iter()
                 .filter(|(_, value)| is_truthy(value))
-                .map(|(base_url, _)| base_url)
+                .map(|(service_name, _)| service_name)
                 .collect(),
         })
     }
 
-    fn matches(&self, url: &str) -> bool {
-        self.base_urls
-            .iter()
-            .any(|base_url| url.starts_with(base_url.as_str()))
+    fn matches(&self, service_name: &str) -> bool {
+        self.service_names.iter().any(|name| name == service_name)
     }
 }
 
@@ -209,9 +256,9 @@ enum Route {
     /// Rewritten onto the desktop latchkey gateway and run by the system
     /// curl.
     DesktopProxy,
-    /// Handed verbatim to the Chrome-impersonating curl.
+    /// Handed to the Chrome-impersonating curl.
     Impersonate,
-    /// Handed verbatim to the system curl.
+    /// Handed to the system curl.
     SystemCurl,
 }
 
@@ -219,8 +266,8 @@ fn choose_route(argv: &[String], desktop_proxy: Option<&DesktopProxyRules>) -> R
     // The desktop proxy is decided first: a request that also carries the
     // impersonation marker must keep it for the desktop gateway's own
     // curl, which the impersonator here would strip.
-    let proxied =
-        request_url(argv).is_some_and(|url| desktop_proxy.is_some_and(|rules| rules.matches(url)));
+    let proxied = header_value(argv, MATCHED_SERVICE_HEADER_NAME)
+        .is_some_and(|service_name| desktop_proxy.is_some_and(|rules| rules.matches(service_name)));
     if proxied {
         Route::DesktopProxy
     } else if has_header(argv, MARKER_HEADER_NAME) {
@@ -332,12 +379,6 @@ fn resolve_impersonator() -> PathBuf {
     })
 }
 
-fn is_stripped_for_impersonation(header_argument: &str) -> bool {
-    IMPERSONATE_STRIPPED_HEADERS
-        .iter()
-        .any(|name| is_header_named(header_argument, name))
-}
-
 /// The argv handed to curl-impersonate for a marked invocation.
 ///
 /// Three flags go in front. `--impersonate <profile>` is the whole point.
@@ -354,23 +395,7 @@ fn impersonate_args(argv: &[String], profile: &str) -> Vec<String> {
             .into_iter()
             .map(str::to_string),
     );
-    let mut it = argv.iter();
-    while let Some(tok) = it.next() {
-        if is_header_flag(tok) {
-            // A header's value belongs to it: keep or drop the pair as a
-            // unit, so a value that looks like a flag is never re-read.
-            match it.next() {
-                Some(value) if is_stripped_for_impersonation(value) => continue,
-                Some(value) => {
-                    rewritten.push(tok.clone());
-                    rewritten.push(value.clone());
-                }
-                None => rewritten.push(tok.clone()),
-            }
-        } else {
-            rewritten.push(tok.clone());
-        }
-    }
+    rewritten.extend(without_headers(argv, IMPERSONATE_STRIPPED_HEADERS));
     rewritten
 }
 
@@ -408,7 +433,11 @@ fn main() {
         .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
 
     let desktop_proxy = DesktopProxyRules::from_env().unwrap_or_else(|message| die(message));
-    let target = match choose_route(&argv, desktop_proxy.as_ref()) {
+    let route = choose_route(&argv, desktop_proxy.as_ref());
+    // Read above, and of no use to anyone after us: not to the desktop
+    // gateway, which would forward it, nor to the third party.
+    argv = without_headers(&argv, &[MATCHED_SERVICE_HEADER_NAME]);
+    let target = match route {
         Route::DesktopProxy => {
             let gateway = DesktopGateway::from_env().unwrap_or_else(|message| die(message));
             argv =
@@ -547,19 +576,24 @@ mod tests {
         }
     }
 
-    fn rules(base_urls: &[&str]) -> DesktopProxyRules {
+    fn rules(service_names: &[&str]) -> DesktopProxyRules {
         DesktopProxyRules {
-            base_urls: base_urls.iter().map(|u| u.to_string()).collect(),
+            service_names: service_names.iter().map(|n| n.to_string()).collect(),
         }
     }
 
-    fn gateway_invocation() -> Vec<String> {
+    /// What the VPS gateway hands us for a request latchkey matched to
+    /// `service_name`: latchkey's header ahead of the caller's arguments.
+    fn gateway_invocation(service_name: &str) -> Vec<String> {
+        let matched_service = format!("X-Latchkey-Matched-Service: {service_name}");
         argv(&[
             "-sS",
             "-D",
             "/tmp/headers",
             "-X",
             "POST",
+            "-H",
+            &matched_service,
             "-H",
             "User-Agent: curl/8.7.1",
             "-H",
@@ -578,36 +612,29 @@ mod tests {
     fn config_keeps_the_keys_with_truthy_values() {
         let parsed = DesktopProxyRules::parse(
             r#"{
-                "https://slack.com/api/": true,
-                "https://api.github.com/": 1,
-                "https://gitlab.com/api/": "yes",
-                "https://example.com/a/": [],
-                "https://example.com/b/": {},
-                "https://example.com/c/": 0.5,
-                "https://off.example.com/false/": false,
-                "https://off.example.com/zero/": 0,
-                "https://off.example.com/float-zero/": 0.0,
-                "https://off.example.com/empty/": "",
-                "https://off.example.com/null/": null
+                "slack": true,
+                "github": 1,
+                "gitlab": "yes",
+                "on-a": [],
+                "on-b": {},
+                "on-c": 0.5,
+                "off-false": false,
+                "off-zero": 0,
+                "off-float-zero": 0.0,
+                "off-empty": "",
+                "off-null": null
             }"#,
         )
         .expect("parses");
         assert_eq!(
             parsed,
-            rules(&[
-                "https://api.github.com/",
-                "https://example.com/a/",
-                "https://example.com/b/",
-                "https://example.com/c/",
-                "https://gitlab.com/api/",
-                "https://slack.com/api/",
-            ])
+            rules(&["github", "gitlab", "on-a", "on-b", "on-c", "slack"])
         );
     }
 
     #[test]
     fn config_that_is_not_an_object_is_an_error() {
-        for text in ["[]", "\"https://slack.com/\"", "null", "true", "{", ""] {
+        for text in ["[]", "\"slack\"", "null", "true", "{", ""] {
             assert!(
                 DesktopProxyRules::parse(text).is_err(),
                 "unexpectedly parsed {text:?}"
@@ -616,31 +643,90 @@ mod tests {
         assert_eq!(DesktopProxyRules::parse("{}").unwrap(), rules(&[]));
     }
 
-    /// The match is latchkey's `url.startsWith(baseApiUrl)`: a plain
-    /// prefix on the raw strings, nothing normalized.
+    /// A service name is matched whole and as written: latchkey's names
+    /// are case-sensitive identifiers, and one may be a prefix of another
+    /// (`fastmail`, `fastmail-dav`).
     #[test]
-    fn matching_is_a_plain_prefix_test_like_latchkey() {
-        let rules = rules(&["https://api.calendly.com/", "http://a.example.com"]);
-        for url in [
-            "https://api.calendly.com/",
-            "https://api.calendly.com/users/me",
-            "https://api.calendly.com/x?y=https://other.example.com/",
-            "http://a.example.com",
-            "http://a.example.com/path",
-            "http://a.example.com.evil.com/",
-        ] {
-            assert!(rules.matches(url), "{url:?} should match");
+    fn a_service_name_matches_exactly() {
+        let rules = rules(&["fastmail", "google-docs"]);
+        for service_name in ["fastmail", "google-docs"] {
+            assert!(rules.matches(service_name), "{service_name:?} should match");
         }
-        for url in [
-            "https://api.calendly.com",
-            "https://API.calendly.com/users/me",
-            "http://api.calendly.com/users/me",
-            "https://www.api.calendly.com/",
-            "https://a.example.com",
-            "https://evil.com/?u=https://api.calendly.com/",
+        for service_name in [
+            "fastmail-dav",
+            "fast",
+            "Fastmail",
+            "google",
+            "",
+            " fastmail",
         ] {
-            assert!(!rules.matches(url), "{url:?} should not match");
+            assert!(
+                !rules.matches(service_name),
+                "{service_name:?} should not match"
+            );
         }
+    }
+
+    #[test]
+    fn header_value_is_the_first_matching_header_trimmed() {
+        let tokens = argv(&[
+            "-H",
+            "Accept: x-latchkey-matched-service: no",
+            "--header",
+            "x-latchkey-matched-service:  slack ",
+            "-H",
+            "X-Latchkey-Matched-Service: github",
+            "https://example.com/",
+        ]);
+        assert_eq!(
+            header_value(&tokens, MATCHED_SERVICE_HEADER_NAME),
+            Some("slack")
+        );
+        assert_eq!(
+            header_value(&tokens, "Accept"),
+            Some("x-latchkey-matched-service: no")
+        );
+        assert_eq!(header_value(&tokens, "X-Absent"), None);
+        assert_eq!(
+            header_value(
+                &argv(&["-H", "X-Latchkey-Matched-Service;"]),
+                MATCHED_SERVICE_HEADER_NAME
+            ),
+            Some("")
+        );
+        assert_eq!(
+            header_value(&argv(&["-H"]), MATCHED_SERVICE_HEADER_NAME),
+            None
+        );
+    }
+
+    #[test]
+    fn without_headers_drops_each_named_header_with_its_flag() {
+        let tokens = argv(&[
+            "-sS",
+            "-H",
+            "X-Latchkey-Matched-Service: slack",
+            "-H",
+            "Accept: */*",
+            "--header",
+            "x-latchkey-matched-service: github",
+            "-H",
+            "X-Note: X-Latchkey-Matched-Service: kept",
+            "https://example.com/",
+            "-H",
+        ]);
+        assert_eq!(
+            without_headers(&tokens, &[MATCHED_SERVICE_HEADER_NAME]),
+            argv(&[
+                "-sS",
+                "-H",
+                "Accept: */*",
+                "-H",
+                "X-Note: X-Latchkey-Matched-Service: kept",
+                "https://example.com/",
+                "-H",
+            ])
+        );
     }
 
     /// A matched request goes to the desktop proxy even when it also
@@ -648,65 +734,74 @@ mod tests {
     /// desktop gateway's own curl intact.
     #[test]
     fn desktop_proxy_is_decided_before_impersonation() {
-        let slack = rules(&["https://slack.com/api/"]);
+        let slack = rules(&["slack"]);
         assert_eq!(
-            choose_route(&gateway_invocation(), Some(&slack)),
+            choose_route(&gateway_invocation("slack"), Some(&slack)),
             Route::DesktopProxy
         );
         assert_eq!(
-            choose_route(&gateway_invocation(), None),
+            choose_route(&gateway_invocation("slack"), None),
             Route::Impersonate
         );
         assert_eq!(
-            choose_route(&gateway_invocation(), Some(&rules(&["https://claude.ai/"]))),
+            choose_route(&gateway_invocation("slack"), Some(&rules(&["claude-ai"]))),
             Route::Impersonate
         );
         assert_eq!(
             choose_route(
-                &argv(&["-H", "Accept: */*", "https://slack.com/api/users.list"]),
+                &argv(&[
+                    "-H",
+                    "X-Latchkey-Matched-Service: slack",
+                    "https://slack.com/api/users.list"
+                ]),
                 Some(&slack)
             ),
             Route::DesktopProxy
-        );
-        assert_eq!(
-            choose_route(
-                &argv(&["-H", "Accept: */*", "https://example.com/"]),
-                Some(&slack)
-            ),
-            Route::SystemCurl
         );
     }
 
-    /// Only the last argument is the request URL; a rule never matches
-    /// a URL that appears elsewhere, and an invocation without a URL
-    /// (`curl --version`) is not proxied.
+    /// The decision is latchkey's statement of the service and nothing
+    /// else: a URL that happens to belong to a routed service is not
+    /// proxied when latchkey did not say so, which is the case for a
+    /// request it injected nothing into.
     #[test]
-    fn only_the_last_argument_is_matched() {
-        let slack = rules(&["https://slack.com/api/"]);
+    fn only_the_matched_service_header_decides() {
+        let slack = rules(&["slack"]);
         for tokens in [
             argv(&["--version"]),
             argv(&[]),
-            argv(&["https://slack.com/api/users.list", "-H"]),
+            argv(&["-H", "Accept: */*", "https://slack.com/api/users.list"]),
             argv(&[
                 "-H",
-                "Referer: https://slack.com/api/",
-                "https://example.com/",
+                "X-Latchkey-Matched-Service: github",
+                "https://slack.com/api/users.list",
             ]),
-            argv(&["-o", "https://slack.com/api/users.list"]),
+            argv(&[
+                "-H",
+                "X-Latchkey-Matched-Service;",
+                "https://slack.com/api/users.list",
+            ]),
+            argv(&[
+                "-o",
+                "X-Latchkey-Matched-Service: slack",
+                "https://slack.com/api/users.list",
+            ]),
         ] {
-            let expected =
-                if tokens.last().map(String::as_str) == Some("https://slack.com/api/users.list") {
-                    Route::DesktopProxy
-                } else {
-                    Route::SystemCurl
-                };
-            assert_eq!(choose_route(&tokens, Some(&slack)), expected, "{tokens:?}");
+            assert_eq!(
+                choose_route(&tokens, Some(&slack)),
+                Route::SystemCurl,
+                "{tokens:?}"
+            );
         }
     }
 
     #[test]
     fn rewrites_a_matched_invocation_onto_the_desktop_gateway() {
-        let rewritten = rewrite_for_desktop_proxy(&gateway_invocation(), &gateway_with_secrets())
+        // `main` drops latchkey's header before rewriting: it is of no use
+        // to the desktop gateway, which would forward it to the third party.
+        let invocation =
+            without_headers(&gateway_invocation("slack"), &[MATCHED_SERVICE_HEADER_NAME]);
+        let rewritten = rewrite_for_desktop_proxy(&invocation, &gateway_with_secrets())
             .expect("rewrite succeeds");
         assert_eq!(
             rewritten,
