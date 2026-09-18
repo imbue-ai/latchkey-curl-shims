@@ -113,6 +113,25 @@ The pieces, in the order they run:
    published as a GitHub release with a `SHA256SUMS`; a
    `workflow_dispatch` run only uploads them as workflow artifacts.
 
+Every tarball, and the two binaries inside it, carries a build
+provenance attestation: a [SLSA](https://slsa.dev) statement that the
+job signs through Sigstore with its GitHub OIDC identity and that
+GitHub stores with this repo. It ties the file's digest to this
+workflow, the commit it ran at and the run that produced it, so a
+tarball someone hands you can be checked against GitHub rather than
+trusted:
+
+```sh
+gh attestation verify latchkey-curl-shims-aarch64-apple-darwin.tar.gz -R imbue-ai/latchkey-curl-shims
+```
+
+The same command works on an extracted `latchkey-curl-router` or
+`curl-impersonate`. The build job verifies its own attestations right
+after signing and the publish job verifies every tarball again before
+creating the release, so a release exists only if the check passes.
+Each tarball's `SOURCE` file names this repo's commit and the upstream
+curl-impersonate commit as plain text, for readers without `gh`.
+
 The six triples: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`. The musl

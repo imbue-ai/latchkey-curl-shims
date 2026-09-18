@@ -20,6 +20,14 @@
 # (checkout, upload-artifact) inside an Alpine container on an arm64
 # runner. The router is built on the host with rustup's musl target,
 # which ships its own static libc.
+#
+# Every tarball, and the two binaries inside it, gets a build provenance
+# attestation: a SLSA statement signed through Sigstore with the job's
+# OIDC identity and stored with this repo, which ties the bytes to this
+# workflow file, this commit and this run. `gh attestation verify <file>
+# -R imbue-ai/latchkey-curl-shims` checks it; the build and publish jobs
+# both run that check themselves, so a run whose attestations do not
+# verify never publishes.
 name: release
 
 on:
@@ -28,13 +36,16 @@ on:
       - "v*"
   workflow_dispatch:
 
-permissions:
-  contents: write  # gh release create
+permissions: {}
 
 jobs:
   build:
     name: build (${{ matrix.triple }})
     runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+      id-token: write      # the Sigstore signing identity
+      attestations: write  # store the provenance with the repo
     strategy:
       fail-fast: false
       matrix:
@@ -193,21 +204,53 @@ jobs:
       # The two public names are what consumers resolve by: the router
       # finds the impersonator as its `curl-impersonate` sibling, and
       # whatever installs the tarball looks for the router by its name.
+      # SOURCE names this repo's commit above the upstream one build.sh
+      # wrote, so the tarball says where every byte in it came from.
       - name: Stage the tarball
         env:
           TRIPLE: ${{ matrix.triple }}
           ROUTER: ${{ steps.router.outputs.bin }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           stage="latchkey-curl-shims-${TRIPLE}"
           mkdir -p "${stage}"
           cp "${ROUTER}" "${stage}/latchkey-curl-router"
           cp "out/curl-impersonate-${TRIPLE}/curl-impersonate" "${stage}/curl-impersonate"
-          cp "out/curl-impersonate-${TRIPLE}"/LICENSE-* "out/curl-impersonate-${TRIPLE}/SOURCE" "${stage}/"
+          cp "out/curl-impersonate-${TRIPLE}"/LICENSE-* "${stage}/"
+          {
+              echo "${REPOSITORY} ${GITHUB_SHA} (${REF_NAME})"
+              cat "out/curl-impersonate-${TRIPLE}/SOURCE"
+          } > "${stage}/SOURCE"
+          cat "${stage}/SOURCE"
           chmod +x "${stage}/latchkey-curl-router" "${stage}/curl-impersonate"
           "${stage}/curl-impersonate" --version
           tar -czf "${stage}.tar.gz" "${stage}"
           ls -l "${stage}.tar.gz"
+
+      # The tarball is what a release serves; the binaries are attested
+      # too so an extracted copy can be checked on its own.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            latchkey-curl-shims-${{ matrix.triple }}.tar.gz
+            latchkey-curl-shims-${{ matrix.triple }}/latchkey-curl-router
+            latchkey-curl-shims-${{ matrix.triple }}/curl-impersonate
+
+      - name: Verify the attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIPLE: ${{ matrix.triple }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for subject in \
+              "latchkey-curl-shims-${TRIPLE}.tar.gz" \
+              "latchkey-curl-shims-${TRIPLE}/latchkey-curl-router" \
+              "latchkey-curl-shims-${TRIPLE}/curl-impersonate"; do
+              gh attestation verify "${subject}" -R "${REPOSITORY}" --signer-workflow "${REPOSITORY}/.github/workflows/release.yml"
+          done
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -220,6 +263,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh release create
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -233,6 +278,17 @@ jobs:
         with:
           path: assets
           merge-multiple: true
+
+      # What was downloaded is what was attested, or nothing is published.
+      - name: Verify the attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for tarball in assets/latchkey-curl-shims-*.tar.gz; do
+              gh attestation verify "${tarball}" -R "${REPOSITORY}" --signer-workflow "${REPOSITORY}/.github/workflows/release.yml"
+          done
 
       # A tag that already has a release fails here rather than
       # overwriting bytes some consumer may already pin by sha256.
@@ -253,6 +309,12 @@ jobs:
           cat SHA256SUMS
           notes="$(cat <<EOF
           \`latchkey-curl-router\` at \`${GITHUB_SHA}\` and \`curl-impersonate\` built from source at [lexiforest/curl-impersonate ${UPSTREAM_TAG}](https://github.com/lexiforest/curl-impersonate/tree/${UPSTREAM_COMMIT}) (\`${UPSTREAM_COMMIT}\`), by run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}.
+
+          Every tarball, and each binary inside it, carries a [build provenance attestation](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/attestations):
+
+          \`\`\`
+          gh attestation verify latchkey-curl-shims-<triple>.tar.gz -R ${GITHUB_REPOSITORY}
+          \`\`\`
 
           \`\`\`
           $(cat SHA256SUMS)
