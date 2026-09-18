@@ -78,12 +78,12 @@ service whose value is truthy in the JavaScript sense (not `false`, `0`,
 The router does not match URLs itself. Latchkey decides which service a
 URL belongs to, by prefix or by pattern, and reports it in the
 `X-Latchkey-Matched-Service` header when it runs with
-`LATCHKEY_POPULATE_HEADERS_FOR_CURL=X-Latchkey-Matched-Service`. Without
-that setting there is no header and nothing is proxied. Latchkey sets
-the header only for a request it injected credentials into, and removes
-any copy the caller supplied. The router drops the header from every
-invocation, whichever route it takes, so it reaches neither the desktop
-gateway nor the third party.
+`LATCHKEY_DIAGNOSTIC_HEADERS=1`. Without that setting there is no header
+and nothing is proxied. Latchkey sets the header only for a request it
+injected credentials into, and puts it ahead of the caller's arguments,
+so the router reads the first occurrence. The router drops every
+occurrence from the invocation, whichever route it takes, so the header
+reaches neither the desktop gateway nor the third party.
 
 The rewritten request is addressed to the last argument of the
 invocation, which is where `latchkey curl` and the gateway both put the

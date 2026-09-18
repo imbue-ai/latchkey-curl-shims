@@ -35,11 +35,12 @@ const MARKER_HEADER_NAME: &str = "X-Imbue-Impersonate";
 const DESKTOP_PROXY_CONFIG_ENV: &str = "LATCHKEY_DESKTOP_PROXY_CONFIG";
 
 /// The header latchkey reports the matched service in, when it runs with
-/// `LATCHKEY_POPULATE_HEADERS_FOR_CURL=X-Latchkey-Matched-Service`. Latchkey
-/// decides which service a URL belongs to (by prefix or by pattern), so we
-/// take its answer rather than matching URLs a second time. Latchkey removes
-/// any copy the caller supplied, and the header is for us alone: it is
-/// dropped from every invocation before curl runs.
+/// `LATCHKEY_DIAGNOSTIC_HEADERS=1`. Latchkey decides which service a URL
+/// belongs to (by prefix or by pattern), so we take its answer rather than
+/// matching URLs a second time. Latchkey puts its header ahead of the
+/// caller's arguments and leaves a copy the caller supplied in place, so the
+/// first occurrence is the one read. The header is for us alone: every
+/// occurrence is dropped before curl runs.
 const MATCHED_SERVICE_HEADER_NAME: &str = "X-Latchkey-Matched-Service";
 
 /// Env var holding the base URL of the latchkey gateway on the user's
