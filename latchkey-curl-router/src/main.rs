@@ -47,14 +47,25 @@ const DESKTOP_PROXY_CONFIG_ENV: &str = "LATCHKEY_DESKTOP_PROXY_CONFIG";
 /// address on purpose.
 const DESKTOP_PROXY_GATEWAY_URL_ENV: &str = "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL";
 
-/// Env var holding the password to send as [`GATEWAY_PASSWORD_HEADER_NAME`].
-/// This is the password the gateway running us listens with: in minds,
-/// the desktop and every VPS gateway share one password (derived on the
-/// desktop and handed to each machine at provisioning), which is also
-/// what lets the VPS's forwarding extension pass a caller's password
-/// through to the desktop unchanged. Optional: an empty or unset value
-/// sends no password header, for a gateway that requires none.
-const DESKTOP_PROXY_GATEWAY_PASSWORD_ENV: &str = "LATCHKEY_GATEWAY_LISTEN_PASSWORD";
+/// Env var naming the file that holds the password to send as
+/// [`GATEWAY_PASSWORD_HEADER_NAME`]: the desktop gateway's own listen
+/// password. It is not the password the gateway running us listens with.
+/// In minds that one is fixed by whichever of the user's computers created
+/// the workspace, while the desktop's belongs to whichever computer is
+/// connected now, and is rewritten in this file when that changes. It is
+/// the variable minds already gives the VPS gateway's forwarding extension.
+/// Unset or empty: no password header is sent, for a gateway that requires
+/// none. Set but unreadable or empty: an error.
+const DESKTOP_PROXY_GATEWAY_PASSWORD_FILE_ENV: &str =
+    "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE";
+
+/// Env var naming the file that holds the JWT to send as
+/// [`GATEWAY_PERMISSIONS_OVERRIDE_HEADER_NAME`]. The desktop gateway checks
+/// a request against the permissions file this JWT names instead of its
+/// default one, which in minds denies everything. Same source and same
+/// unset/unreadable handling as [`DESKTOP_PROXY_GATEWAY_PASSWORD_FILE_ENV`].
+const DESKTOP_PROXY_PERMISSIONS_OVERRIDE_FILE_ENV: &str =
+    "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE";
 
 /// The latchkey gateway's outbound-proxy endpoint: `<gateway>/gateway/<target-url>`.
 const GATEWAY_PATH_PREFIX: &str = "/gateway/";
@@ -62,10 +73,14 @@ const GATEWAY_PATH_PREFIX: &str = "/gateway/";
 /// The header a latchkey gateway reads its shared password from.
 const GATEWAY_PASSWORD_HEADER_NAME: &str = "X-Latchkey-Gateway-Password";
 
+/// The header a latchkey gateway reads a permissions-override JWT from.
+const GATEWAY_PERMISSIONS_OVERRIDE_HEADER_NAME: &str = "X-Latchkey-Gateway-Permissions-Override";
+
 /// The header that asks a latchkey gateway to forward a `/gateway/<url>`
-/// request exactly as received — no credential injection, no permission
-/// check — because the credentials are already in it, injected by the
-/// gateway that handed the request to us.
+/// request without injecting credentials, because they are already in it,
+/// injected by the gateway that handed the request to us. The receiving
+/// gateway still runs its permission check, and refuses the header
+/// outright unless it runs with `LATCHKEY_PASSTHROUGH_UNKNOWN`.
 const GATEWAY_NO_CREDENTIALS_HEADER: &str = "X-Latchkey-Gateway-No-Credentials: 1";
 
 /// Filenames to look for next to `current_exe()` — mirrors
@@ -222,6 +237,7 @@ struct DesktopGateway {
     /// appended directly.
     base_url: String,
     password: Option<String>,
+    permissions_override: Option<String>,
 }
 
 impl DesktopGateway {
@@ -235,14 +251,30 @@ impl DesktopGateway {
                 ))
             }
         };
-        let password = std::env::var(DESKTOP_PROXY_GATEWAY_PASSWORD_ENV)
-            .ok()
-            .filter(|value| !value.is_empty());
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            password,
+            password: read_secret_file(DESKTOP_PROXY_GATEWAY_PASSWORD_FILE_ENV)?,
+            permissions_override: read_secret_file(DESKTOP_PROXY_PERMISSIONS_OVERRIDE_FILE_ENV)?,
         })
     }
+}
+
+/// The trimmed contents of the file `env_name` names. `None` when the
+/// variable is unset or empty; an error when it names a file that cannot
+/// be read or holds nothing, since the operator asked for a secret to be
+/// sent and the desktop gateway would refuse the request without it.
+fn read_secret_file(env_name: &str) -> Result<Option<String>, String> {
+    let path = match std::env::var(env_name) {
+        Ok(value) if !value.is_empty() => value,
+        _ => return Ok(None),
+    };
+    let content = std::fs::read_to_string(&path)
+        .map_err(|err| format!("cannot read {env_name}={path}: {err}"))?;
+    let secret = content.trim();
+    if secret.is_empty() {
+        return Err(format!("{env_name}={path} is empty"));
+    }
+    Ok(Some(secret.to_string()))
 }
 
 /// Rewrite a matched invocation so it goes to the desktop gateway's
@@ -260,12 +292,18 @@ fn rewrite_for_desktop_proxy(
         ));
     };
 
-    let mut rewritten = Vec::with_capacity(argv.len() + 4);
+    let mut rewritten = Vec::with_capacity(argv.len() + 6);
     rewritten.push("-H".to_string());
     rewritten.push(GATEWAY_NO_CREDENTIALS_HEADER.to_string());
     if let Some(password) = &gateway.password {
         rewritten.push("-H".to_string());
         rewritten.push(format!("{GATEWAY_PASSWORD_HEADER_NAME}: {password}"));
+    }
+    if let Some(permissions_override) = &gateway.permissions_override {
+        rewritten.push("-H".to_string());
+        rewritten.push(format!(
+            "{GATEWAY_PERMISSIONS_OVERRIDE_HEADER_NAME}: {permissions_override}"
+        ));
     }
     rewritten.extend_from_slice(&argv[..argv.len() - 1]);
     rewritten.push(format!(
@@ -493,10 +531,19 @@ mod tests {
         assert!(!has_header(&tokens, MARKER_HEADER_NAME));
     }
 
-    fn test_gateway(password: Option<&str>) -> DesktopGateway {
+    fn gateway_with_secrets() -> DesktopGateway {
         DesktopGateway {
             base_url: "http://127.0.0.1:1988".to_string(),
-            password: password.map(str::to_string),
+            password: Some("hunter2".to_string()),
+            permissions_override: Some("override.jwt".to_string()),
+        }
+    }
+
+    fn gateway_without_secrets() -> DesktopGateway {
+        DesktopGateway {
+            base_url: "http://127.0.0.1:1988".to_string(),
+            password: None,
+            permissions_override: None,
         }
     }
 
@@ -659,9 +706,8 @@ mod tests {
 
     #[test]
     fn rewrites_a_matched_invocation_onto_the_desktop_gateway() {
-        let rewritten =
-            rewrite_for_desktop_proxy(&gateway_invocation(), &test_gateway(Some("hunter2")))
-                .expect("rewrite succeeds");
+        let rewritten = rewrite_for_desktop_proxy(&gateway_invocation(), &gateway_with_secrets())
+            .expect("rewrite succeeds");
         assert_eq!(
             rewritten,
             argv(&[
@@ -669,6 +715,8 @@ mod tests {
                 "X-Latchkey-Gateway-No-Credentials: 1",
                 "-H",
                 "X-Latchkey-Gateway-Password: hunter2",
+                "-H",
+                "X-Latchkey-Gateway-Permissions-Override: override.jwt",
                 "-sS",
                 "-D",
                 "/tmp/headers",
@@ -688,10 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn desktop_proxy_rewrite_sends_no_password_header_when_none_is_configured() {
-        let rewritten =
-            rewrite_for_desktop_proxy(&argv(&["https://example.com/x"]), &test_gateway(None))
-                .expect("rewrite succeeds");
+    fn desktop_proxy_rewrite_sends_no_secret_headers_when_none_are_configured() {
+        let rewritten = rewrite_for_desktop_proxy(
+            &argv(&["https://example.com/x"]),
+            &gateway_without_secrets(),
+        )
+        .expect("rewrite succeeds");
         assert_eq!(
             rewritten,
             argv(&[
@@ -712,7 +762,7 @@ mod tests {
             "https://a.example.com/x?q=https://b.example.com/y",
             "http://a.example.com/a/../b",
         ] {
-            let rewritten = rewrite_for_desktop_proxy(&argv(&[url]), &test_gateway(None))
+            let rewritten = rewrite_for_desktop_proxy(&argv(&[url]), &gateway_without_secrets())
                 .expect("rewrite succeeds");
             assert_eq!(
                 rewritten.last().map(String::as_str),
@@ -863,7 +913,7 @@ mod tests {
             argv(&["https://example.com/x", "-H", "Accept: */*"]),
             argv(&["ftp://example.com/x"]),
         ] {
-            let result = rewrite_for_desktop_proxy(&tokens, &test_gateway(None));
+            let result = rewrite_for_desktop_proxy(&tokens, &gateway_without_secrets());
             assert!(result.is_err(), "unexpectedly rewrote {tokens:?}");
         }
     }

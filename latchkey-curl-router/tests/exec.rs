@@ -50,6 +50,8 @@ impl Sandbox {
         command.env_remove("LATCHKEY_DESKTOP_PROXY_CONFIG");
         command.env_remove("LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL");
         command.env_remove("LATCHKEY_GATEWAY_LISTEN_PASSWORD");
+        command.env_remove("LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE");
+        command.env_remove("LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE");
         command
     }
 
@@ -64,10 +66,14 @@ impl Sandbox {
         command
     }
 
-    fn write_desktop_proxy_config(&self, name: &str, json: &str) -> PathBuf {
+    fn write_file(&self, name: &str, content: &str) -> PathBuf {
         let path = self.dir.join(name);
-        fs::write(&path, json).unwrap();
+        fs::write(&path, content).unwrap();
         path
+    }
+
+    fn write_desktop_proxy_config(&self, name: &str, json: &str) -> PathBuf {
+        self.write_file(name, json)
     }
 }
 
@@ -183,7 +189,17 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
             "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL",
             "http://127.0.0.1:1988/",
         )
-        .env("LATCHKEY_GATEWAY_LISTEN_PASSWORD", "hunter2")
+        // The password the gateway running the router listens with is not
+        // the desktop's, and must not be the one sent.
+        .env("LATCHKEY_GATEWAY_LISTEN_PASSWORD", "the-machines-own")
+        .env(
+            "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE",
+            sandbox.write_file("desktop_password", "hunter2\n"),
+        )
+        .env(
+            "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE",
+            sandbox.write_file("desktop_permissions_override", "override.jwt\n"),
+        )
         .args([
             "-sS",
             "-H",
@@ -198,6 +214,8 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
             "X-Latchkey-Gateway-No-Credentials: 1",
             "-H",
             "X-Latchkey-Gateway-Password: hunter2",
+            "-H",
+            "X-Latchkey-Gateway-Permissions-Override: override.jwt",
             "-sS",
             "-H",
             "X-Imbue-Impersonate: 1",
@@ -252,5 +270,42 @@ fn desktop_proxy_config_that_cannot_be_used_is_an_error_not_a_direct_request() {
             output.stdout.is_empty(),
             "{config:?}: nothing should have been exec'd"
         );
+    }
+}
+
+#[test]
+fn desktop_gateway_secret_file_that_cannot_be_used_is_an_error_not_an_unauthenticated_request() {
+    let sandbox = Sandbox::new("desktop-proxy-secret-errors");
+    let config =
+        sandbox.write_desktop_proxy_config("matched.json", r#"{"https://slack.com/api/": true}"#);
+    let missing = sandbox.dir.join("does-not-exist");
+    let blank = sandbox.write_file("blank", " \n");
+    for env_name in [
+        "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE",
+        "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE",
+    ] {
+        for (secret_file, needle) in [(&missing, "cannot read"), (&blank, "is empty")] {
+            let output = sandbox
+                .router_with_fake_system_curl()
+                .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
+                .env(
+                    "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL",
+                    "http://127.0.0.1:1988/",
+                )
+                .env(env_name, secret_file)
+                .args(["https://slack.com/api/users.list"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "{env_name}: {stderr}");
+            assert!(
+                stderr.contains(env_name) && stderr.contains(needle),
+                "{env_name}: {stderr}"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "{env_name}: nothing should have been exec'd"
+            );
+        }
     }
 }
