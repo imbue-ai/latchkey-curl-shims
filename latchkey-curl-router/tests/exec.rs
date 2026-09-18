@@ -155,9 +155,11 @@ fn marked_invocation_execs_the_impersonator_with_the_default_profile() {
 }
 
 #[test]
-fn unmarked_invocation_execs_the_curl_on_path_untouched() {
+fn unmarked_invocation_execs_the_curl_on_path_without_the_matched_service_header() {
     let sandbox = Sandbox::new("system-curl");
     let got = run(sandbox.router_with_fake_system_curl().args([
+        "-H",
+        "X-Latchkey-Matched-Service: slack",
         "-sS",
         "-H",
         "User-Agent: curl/8.7.1",
@@ -180,7 +182,7 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
     let sandbox = Sandbox::new("desktop-proxy");
     let config = sandbox.write_desktop_proxy_config(
         "desktop-proxy.json",
-        r#"{"https://slack.com/api/": true, "https://claude.ai/": false}"#,
+        r#"{"slack": true, "claude-ai": false}"#,
     );
     let got = run(sandbox
         .router_with_fake_system_curl()
@@ -201,6 +203,8 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
             sandbox.write_file("desktop_permissions_override", "override.jwt\n"),
         )
         .args([
+            "-H",
+            "X-Latchkey-Matched-Service: slack",
             "-sS",
             "-H",
             "X-Imbue-Impersonate: 1",
@@ -223,32 +227,47 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
         ])
     );
 
-    // A URL under a falsy key, or under no key, is routed as if there
-    // were no config: this one carries the marker, so it impersonates.
-    for url in [
-        "https://claude.ai/api/organizations",
-        "https://example.com/",
+    // A service under a falsy key, a service under no key, and a request
+    // latchkey matched to no service are routed as if there were no config:
+    // these carry the marker, so they impersonate. Latchkey's header is
+    // dropped on that route too.
+    for matched_service_header in [
+        Some("X-Latchkey-Matched-Service: claude-ai"),
+        Some("X-Latchkey-Matched-Service: github"),
+        None,
     ] {
-        let got = run(sandbox
-            .router_with_fake_system_curl()
-            .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
-            .env(
-                "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL",
-                "http://127.0.0.1:1988/",
-            )
-            .args(["-H", "X-Imbue-Impersonate: 1", url]));
-        assert_eq!(got[0], "impersonator", "{url}: {got:?}");
+        let mut command = sandbox.router_with_fake_system_curl();
+        command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config).env(
+            "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL",
+            "http://127.0.0.1:1988/",
+        );
+        if let Some(header) = matched_service_header {
+            command.args(["-H", header]);
+        }
+        let got = run(command.args([
+            "-H",
+            "X-Imbue-Impersonate: 1",
+            "https://slack.com/api/users.list",
+        ]));
+        assert_eq!(
+            got[0], "impersonator",
+            "{matched_service_header:?}: {got:?}"
+        );
+        assert!(
+            !got.iter()
+                .any(|line| line.contains("X-Latchkey-Matched-Service")),
+            "{matched_service_header:?}: {got:?}"
+        );
     }
 }
 
 #[test]
 fn desktop_proxy_config_that_cannot_be_used_is_an_error_not_a_direct_request() {
     let sandbox = Sandbox::new("desktop-proxy-errors");
-    let malformed =
-        sandbox.write_desktop_proxy_config("malformed.json", r#"["https://slack.com/api/"]"#);
+    let malformed = sandbox.write_desktop_proxy_config("malformed.json", r#"["slack"]"#);
     let missing = sandbox.dir.join("does-not-exist.json");
     let matched_without_gateway =
-        sandbox.write_desktop_proxy_config("matched.json", r#"{"https://slack.com/api/": true}"#);
+        sandbox.write_desktop_proxy_config("matched.json", r#"{"slack": true}"#);
     for (config, needle) in [
         (malformed, "expected a JSON object"),
         (missing, "cannot read"),
@@ -260,7 +279,11 @@ fn desktop_proxy_config_that_cannot_be_used_is_an_error_not_a_direct_request() {
         let output = sandbox
             .router_with_fake_system_curl()
             .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
-            .args(["https://slack.com/api/users.list"])
+            .args([
+                "-H",
+                "X-Latchkey-Matched-Service: slack",
+                "https://slack.com/api/users.list",
+            ])
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -276,8 +299,7 @@ fn desktop_proxy_config_that_cannot_be_used_is_an_error_not_a_direct_request() {
 #[test]
 fn desktop_gateway_secret_file_that_cannot_be_used_is_an_error_not_an_unauthenticated_request() {
     let sandbox = Sandbox::new("desktop-proxy-secret-errors");
-    let config =
-        sandbox.write_desktop_proxy_config("matched.json", r#"{"https://slack.com/api/": true}"#);
+    let config = sandbox.write_desktop_proxy_config("matched.json", r#"{"slack": true}"#);
     let missing = sandbox.dir.join("does-not-exist");
     let blank = sandbox.write_file("blank", " \n");
     for env_name in [
@@ -293,7 +315,11 @@ fn desktop_gateway_secret_file_that_cannot_be_used_is_an_error_not_an_unauthenti
                     "http://127.0.0.1:1988/",
                 )
                 .env(env_name, secret_file)
-                .args(["https://slack.com/api/users.list"])
+                .args([
+                    "-H",
+                    "X-Latchkey-Matched-Service: slack",
+                    "https://slack.com/api/users.list",
+                ])
                 .output()
                 .unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
