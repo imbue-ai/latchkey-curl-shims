@@ -1,6 +1,6 @@
 [package]
 name = "latchkey-curl-router"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.83"
 description = "A drop-in curl that routes marked requests to a Chrome-impersonating curl"
