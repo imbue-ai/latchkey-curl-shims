@@ -3,7 +3,8 @@
 //! different destination. Impersonation is asked for by a private marker
 //! header in the arguments; the desktop proxy is chosen by looking up the
 //! service latchkey matched the request to, which it reports in another
-//! header, in a config file named in the environment. It exists
+//! header, in a config file named in the environment, and the desktop it
+//! goes to is the one whose device record was touched last. It exists
 //! so a single `LATCHKEY_CURL` binary can serve impersonating and
 //! non-impersonating callers alike without breaking the latter: only
 //! callers that opt in get the Chrome-impersonating curl; everyone else
@@ -18,8 +19,9 @@
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Name of the private routing marker header. Namespaced so it can't
 /// collide with a header a caller legitimately wants to set or strip.
@@ -43,36 +45,62 @@ const DESKTOP_PROXY_CONFIG_ENV: &str = "LATCHKEY_DESKTOP_PROXY_CONFIG";
 /// occurrence is dropped before curl runs.
 const MATCHED_SERVICE_HEADER_NAME: &str = "X-Latchkey-Matched-Service";
 
-/// Env var holding the base URL of the latchkey gateway on the user's
-/// computer, as reachable from this machine (in minds, a reverse tunnel
-/// into the VPS loopback). It is the variable minds already gives the
-/// VPS gateway for its own desktop-forwarding extension; the gateway
-/// runs us as a child, so we inherit it rather than needing one of our
-/// own. Required whenever a request matches the desktop-proxy config; a
-/// matched request with no gateway to send it to is an error, not a
-/// silent direct request, since the operator asked for a different source
-/// address on purpose.
-const DESKTOP_PROXY_GATEWAY_URL_ENV: &str = "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL";
+/// Env var naming the directory of device records: one JSON file per
+/// desktop connected to this machine, written by the desktop itself when
+/// its reverse tunnel comes up and touched by every keepalive (about once
+/// a minute) after that. The user may be connected from several desktops
+/// at once, each with its own tunnel on its own port, so which gateway a
+/// matched request goes to is decided per invocation: the record touched
+/// most recently is the desktop the user is at. It is the variable minds
+/// already gives the VPS gateway for its own desktop-forwarding extension;
+/// the gateway runs us as a child, so we inherit it. Unset or empty:
+/// [`DEFAULT_DESKTOP_DEVICES_DIR`].
+const DESKTOP_DEVICES_DIR_ENV: &str = "LATCHKEY_EXTENSION_DEVICES_DIR";
 
-/// Env var naming the file that holds the password to send as
+/// Where minds keeps the device records when [`DESKTOP_DEVICES_DIR_ENV`]
+/// says nothing else.
+const DEFAULT_DESKTOP_DEVICES_DIR: &str = "/run/mngr-latchkey/devices";
+
+/// The extension of a device record: `<device_id>.json`. Anything else in
+/// the directory (a lock file, an editor backup) is not a record.
+const DESKTOP_DEVICE_RECORD_EXTENSION: &str = "json";
+
+/// Env var holding how long, in seconds, a device record may go untouched
+/// and still count as a connected desktop. A desktop that went away
+/// without cleaning up leaves its record behind, and its port leads
+/// nowhere; the window keeps a stale record from being chosen over an
+/// honest "no desktop is connected". Unset or empty:
+/// [`DEFAULT_DESKTOP_DEVICE_ACTIVE_WINDOW`]. Set but not a positive whole
+/// number: an error.
+const DESKTOP_DEVICE_ACTIVE_WINDOW_ENV: &str = "LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS";
+
+/// Three keepalive intervals: one missed keepalive is a hiccup, three is a
+/// gone desktop.
+const DEFAULT_DESKTOP_DEVICE_ACTIVE_WINDOW: Duration = Duration::from_secs(180);
+
+/// The record's key holding the loopback port the desktop's tunnel
+/// listens on here. The desktop gateway is reached as
+/// `http://127.0.0.1:<port>`: a reverse tunnel lands on this machine's
+/// loopback and nowhere else.
+const DEVICE_RECORD_PORT_KEY: &str = "port";
+
+/// The record's key holding the password to send as
 /// [`GATEWAY_PASSWORD_HEADER_NAME`]: the desktop gateway's own listen
 /// password. It is not the password the gateway running us listens with.
 /// In minds that one is fixed by whichever of the user's computers created
-/// the workspace, while the desktop's belongs to whichever computer is
-/// connected now, and is rewritten in this file when that changes. It is
-/// the variable minds already gives the VPS gateway's forwarding extension.
-/// Unset or empty: no password header is sent, for a gateway that requires
-/// none. Set but unreadable or empty: an error.
-const DESKTOP_PROXY_GATEWAY_PASSWORD_FILE_ENV: &str =
-    "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE";
+/// the workspace, while the desktop's belongs to the computer the record
+/// describes. Absent or `null`: no password header is sent, for a gateway
+/// that requires none. Present but not a non-empty string: an error, since
+/// the desktop asked for a secret to be sent and its gateway would refuse
+/// the request without it.
+const DEVICE_RECORD_PASSWORD_KEY: &str = "gateway_password";
 
-/// Env var naming the file that holds the JWT to send as
+/// The record's key holding the JWT to send as
 /// [`GATEWAY_PERMISSIONS_OVERRIDE_HEADER_NAME`]. The desktop gateway checks
 /// a request against the permissions file this JWT names instead of its
-/// default one, which in minds denies everything. Same source and same
-/// unset/unreadable handling as [`DESKTOP_PROXY_GATEWAY_PASSWORD_FILE_ENV`].
-const DESKTOP_PROXY_PERMISSIONS_OVERRIDE_FILE_ENV: &str =
-    "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE";
+/// default one, which in minds denies everything. Same absent/invalid
+/// handling as [`DEVICE_RECORD_PASSWORD_KEY`].
+const DEVICE_RECORD_PERMISSIONS_OVERRIDE_KEY: &str = "permissions_override";
 
 /// The latchkey gateway's outbound-proxy endpoint: `<gateway>/gateway/<target-url>`.
 const GATEWAY_PATH_PREFIX: &str = "/gateway/";
@@ -277,8 +305,9 @@ fn choose_route(argv: &[String], desktop_proxy: Option<&DesktopProxyRules>) -> R
     }
 }
 
-/// The desktop latchkey gateway a matched request is sent to, read from
-/// the environment inherited from the gateway that runs us.
+/// The desktop latchkey gateway a matched request is sent to: the
+/// desktop whose device record was touched most recently.
+#[derive(Debug, PartialEq, Eq)]
 struct DesktopGateway {
     /// Base URL without a trailing slash, so the endpoint path can be
     /// appended directly.
@@ -288,40 +317,141 @@ struct DesktopGateway {
 }
 
 impl DesktopGateway {
+    /// The gateway of the most recently active desktop. An error when there
+    /// is none, or when its record cannot be used: a matched request with
+    /// no gateway to send it to is an error, not a silent direct request,
+    /// since the operator asked for a different source address on purpose.
     fn from_env() -> Result<Self, String> {
-        let base_url = match std::env::var(DESKTOP_PROXY_GATEWAY_URL_ENV) {
+        let devices_dir = match std::env::var(DESKTOP_DEVICES_DIR_ENV) {
             Ok(value) if !value.is_empty() => value,
-            _ => {
-                return Err(format!(
-                    "request matches {DESKTOP_PROXY_CONFIG_ENV} but \
-                     {DESKTOP_PROXY_GATEWAY_URL_ENV} is not set"
-                ))
-            }
+            _ => DEFAULT_DESKTOP_DEVICES_DIR.to_string(),
         };
+        let active_window = active_window_from_env()?;
+        let record_path =
+            newest_device_record(Path::new(&devices_dir), active_window, SystemTime::now())
+                .map_err(|err| format!("request matches {DESKTOP_PROXY_CONFIG_ENV} but {err}"))?;
+        let text = std::fs::read_to_string(&record_path)
+            .map_err(|err| format!("cannot read device record {}: {err}", record_path.display()))?;
+        Self::parse(&text).map_err(|err| format!("device record {}: {err}", record_path.display()))
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        let value: Value = serde_json::from_str(text).map_err(|err| format!("not JSON: {err}"))?;
+        let Value::Object(record) = value else {
+            return Err("expected a JSON object".to_string());
+        };
+        let port = match record.get(DEVICE_RECORD_PORT_KEY) {
+            Some(Value::Number(number)) => {
+                number.as_u64().filter(|port| (1..=65535).contains(port))
+            }
+            _ => None,
+        }
+        .ok_or_else(|| format!("{DEVICE_RECORD_PORT_KEY:?} is not a TCP port number"))?;
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            password: read_secret_file(DESKTOP_PROXY_GATEWAY_PASSWORD_FILE_ENV)?,
-            permissions_override: read_secret_file(DESKTOP_PROXY_PERMISSIONS_OVERRIDE_FILE_ENV)?,
+            base_url: format!("http://127.0.0.1:{port}"),
+            password: optional_secret(&record, DEVICE_RECORD_PASSWORD_KEY)?,
+            permissions_override: optional_secret(&record, DEVICE_RECORD_PERMISSIONS_OVERRIDE_KEY)?,
         })
     }
 }
 
-/// The trimmed contents of the file `env_name` names. `None` when the
-/// variable is unset or empty; an error when it names a file that cannot
-/// be read or holds nothing, since the operator asked for a secret to be
-/// sent and the desktop gateway would refuse the request without it.
-fn read_secret_file(env_name: &str) -> Result<Option<String>, String> {
-    let path = match std::env::var(env_name) {
-        Ok(value) if !value.is_empty() => value,
-        _ => return Ok(None),
-    };
-    let content = std::fs::read_to_string(&path)
-        .map_err(|err| format!("cannot read {env_name}={path}: {err}"))?;
-    let secret = content.trim();
-    if secret.is_empty() {
-        return Err(format!("{env_name}={path} is empty"));
+/// The secret under `key` in a device record. `None` when the key is
+/// absent or `null`; an error when it holds anything but a non-empty
+/// string. The value itself is kept out of the message: it is a secret.
+fn optional_secret(record: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
+    match record.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(secret)) if !secret.is_empty() => Ok(Some(secret.clone())),
+        Some(_) => Err(format!("{key:?} is neither a non-empty string nor null")),
     }
-    Ok(Some(secret.to_string()))
+}
+
+fn active_window_from_env() -> Result<Duration, String> {
+    let value = match std::env::var(DESKTOP_DEVICE_ACTIVE_WINDOW_ENV) {
+        Ok(value) if !value.is_empty() => value,
+        _ => return Ok(DEFAULT_DESKTOP_DEVICE_ACTIVE_WINDOW),
+    };
+    match value.trim().parse::<u64>() {
+        Ok(seconds) if seconds > 0 => Ok(Duration::from_secs(seconds)),
+        _ => Err(format!(
+            "{DESKTOP_DEVICE_ACTIVE_WINDOW_ENV}={value} is not a positive whole number of seconds"
+        )),
+    }
+}
+
+/// The path of the device record touched most recently, provided that was
+/// within `active_window` of `now`. Only files whose extension is
+/// [`DESKTOP_DEVICE_RECORD_EXTENSION`] count. A record that vanishes while
+/// the directory is being read is a desktop that just disconnected, and is
+/// skipped; any other trouble reading the directory is an error. Ties on
+/// the modification time go to the greater file name, so the choice is
+/// the same on every invocation.
+fn newest_device_record(
+    devices_dir: &Path,
+    active_window: Duration,
+    now: SystemTime,
+) -> Result<PathBuf, String> {
+    let describe_dir = || format!("{DESKTOP_DEVICES_DIR_ENV}={}", devices_dir.display());
+    let entries = std::fs::read_dir(devices_dir).map_err(|err| {
+        format!(
+            "no desktop is connected: cannot list {}: {err}",
+            describe_dir()
+        )
+    })?;
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("cannot list {}: {err}", describe_dir()))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some(DESKTOP_DEVICE_RECORD_EXTENSION) {
+            continue;
+        }
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(format!(
+                    "cannot stat device record {}: {err}",
+                    path.display()
+                ))
+            }
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().map_err(|err| {
+            format!(
+                "cannot read the modification time of {}: {err}",
+                path.display()
+            )
+        })?;
+        if newest
+            .as_ref()
+            .is_none_or(|(newest_modified, newest_path)| {
+                (modified, &path) > (*newest_modified, newest_path)
+            })
+        {
+            newest = Some((modified, path));
+        }
+    }
+    let Some((modified, path)) = newest else {
+        return Err(format!(
+            "no desktop is connected: no device record in {}",
+            describe_dir()
+        ));
+    };
+    // A record from the future (clock skew, a restored snapshot) was
+    // touched "just now" as far as we can tell.
+    let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+    if age > active_window {
+        return Err(format!(
+            "no desktop is active: the newest device record {} was last touched {}s ago, \
+             longer than {DESKTOP_DEVICE_ACTIVE_WINDOW_ENV}={}s",
+            path.display(),
+            age.as_secs(),
+            active_window.as_secs()
+        ));
+    }
+    Ok(path)
 }
 
 /// Rewrite a matched invocation so it goes to the desktop gateway's
@@ -998,6 +1128,201 @@ mod tests {
                 "-H",
             ])
         );
+    }
+
+    /// A record holds the tunnel's loopback port and the desktop gateway's
+    /// secrets; the gateway is on this machine's loopback and nowhere else.
+    #[test]
+    fn device_record_gives_the_gateway_and_its_secrets() {
+        let parsed = DesktopGateway::parse(
+            r#"{
+                "device_id": "mac-1",
+                "port": 41231,
+                "gateway_password": "hunter2",
+                "permissions_override": "override.jwt",
+                "last_seen": "2026-09-28T08:00:00Z"
+            }"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed,
+            DesktopGateway {
+                base_url: "http://127.0.0.1:41231".to_string(),
+                password: Some("hunter2".to_string()),
+                permissions_override: Some("override.jwt".to_string()),
+            }
+        );
+    }
+
+    /// A secret the desktop did not put in its record is not sent, under
+    /// either spelling of "none".
+    #[test]
+    fn device_record_without_secrets_sends_none() {
+        for text in [
+            r#"{"port": 1988}"#,
+            r#"{"port": 1988, "gateway_password": null, "permissions_override": null}"#,
+        ] {
+            assert_eq!(
+                DesktopGateway::parse(text).expect("parses"),
+                DesktopGateway {
+                    base_url: "http://127.0.0.1:1988".to_string(),
+                    password: None,
+                    permissions_override: None,
+                },
+                "{text}"
+            );
+        }
+    }
+
+    /// A record that cannot name a gateway, or asks for a secret it does
+    /// not hold, is an error rather than a guess.
+    #[test]
+    fn device_record_that_cannot_be_used_is_an_error() {
+        for text in [
+            "",
+            "{",
+            "[]",
+            "null",
+            r#"{"gateway_password": "hunter2"}"#,
+            r#"{"port": null}"#,
+            r#"{"port": "1988"}"#,
+            r#"{"port": 0}"#,
+            r#"{"port": -1}"#,
+            r#"{"port": 65536}"#,
+            r#"{"port": 1988.5}"#,
+            r#"{"port": 1988, "gateway_password": ""}"#,
+            r#"{"port": 1988, "gateway_password": 42}"#,
+            r#"{"port": 1988, "permissions_override": ""}"#,
+            r#"{"port": 1988, "permissions_override": false}"#,
+        ] {
+            assert!(
+                DesktopGateway::parse(text).is_err(),
+                "unexpectedly parsed {text:?}"
+            );
+        }
+    }
+
+    /// A secret never appears in the message about it.
+    #[test]
+    fn device_record_errors_do_not_leak_the_value() {
+        let err = DesktopGateway::parse(r#"{"port": 1988, "gateway_password": 12345678}"#)
+            .expect_err("not a string");
+        assert!(!err.contains("12345678"), "{err}");
+    }
+
+    /// A directory of device records, with their modification times set
+    /// relative to a fixed "now", so the newest-first choice is testable.
+    struct DevicesDir {
+        dir: PathBuf,
+        now: SystemTime,
+    }
+
+    impl DevicesDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "latchkey-curl-router-devices-{}-{name}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self {
+                dir,
+                now: SystemTime::now(),
+            }
+        }
+
+        /// A file last touched `age` before now.
+        fn touch(&self, name: &str, age: Duration) -> PathBuf {
+            let path = self.dir.join(name);
+            std::fs::write(&path, "{}").unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(self.now - age).unwrap();
+            path
+        }
+
+        fn newest(&self, active_window: Duration) -> Result<PathBuf, String> {
+            newest_device_record(&self.dir, active_window, self.now)
+        }
+    }
+
+    impl Drop for DevicesDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    const SECS: fn(u64) -> Duration = Duration::from_secs;
+
+    /// The desktop touching its record most recently is the one the user
+    /// is at, whatever its name and whenever it first connected.
+    #[test]
+    fn the_most_recently_touched_record_wins() {
+        let devices = DevicesDir::new("newest");
+        devices.touch("aaa-first-connected.json", SECS(50));
+        let current = devices.touch("mmm-current.json", SECS(5));
+        devices.touch("zzz-idle.json", SECS(120));
+        assert_eq!(devices.newest(SECS(180)).unwrap(), current);
+    }
+
+    /// Only `<device_id>.json` files are records: a lock file, a backup
+    /// or a subdirectory is not a desktop, however fresh.
+    #[test]
+    fn only_json_files_are_device_records() {
+        let devices = DevicesDir::new("only-json");
+        let record = devices.touch("mac-1.json", SECS(30));
+        devices.touch("mac-2.json.tmp", SECS(0));
+        devices.touch("mac-2.json~", SECS(0));
+        devices.touch("notes.txt", SECS(0));
+        std::fs::create_dir(devices.dir.join("nested.json")).unwrap();
+        assert_eq!(devices.newest(SECS(180)).unwrap(), record);
+    }
+
+    /// Two records touched in the same instant resolve the same way every
+    /// time, rather than by directory order.
+    #[test]
+    fn a_tie_on_the_modification_time_is_broken_by_name() {
+        let devices = DevicesDir::new("tie");
+        devices.touch("a.json", SECS(10));
+        let b = devices.touch("b.json", SECS(10));
+        assert_eq!(devices.newest(SECS(180)).unwrap(), b);
+    }
+
+    /// A record older than the window is a desktop that went away without
+    /// cleaning up, not a gateway to send to; a record from the future is
+    /// as fresh as it gets.
+    #[test]
+    fn a_record_older_than_the_window_means_no_active_desktop() {
+        let devices = DevicesDir::new("window");
+        devices.touch("stale.json", SECS(181));
+        let err = devices.newest(SECS(180)).expect_err("stale");
+        assert!(err.contains("no desktop is active"), "{err}");
+        assert!(err.contains("stale.json"), "{err}");
+
+        let fresh = devices.touch("fresh.json", SECS(180));
+        assert_eq!(devices.newest(SECS(180)).unwrap(), fresh);
+
+        let path = devices.dir.join("future.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(devices.now + SECS(3600))
+            .unwrap();
+        assert_eq!(devices.newest(SECS(180)).unwrap(), path);
+    }
+
+    /// No records, or no directory at all, is "no desktop is connected".
+    #[test]
+    fn no_record_means_no_connected_desktop() {
+        let devices = DevicesDir::new("empty");
+        let err = devices.newest(SECS(180)).expect_err("empty");
+        assert!(err.contains("no desktop is connected"), "{err}");
+
+        let missing = devices.dir.join("does-not-exist");
+        let err = newest_device_record(&missing, SECS(180), devices.now).expect_err("missing");
+        assert!(err.contains("no desktop is connected"), "{err}");
+        assert!(err.contains("does-not-exist"), "{err}");
     }
 
     #[test]

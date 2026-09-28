@@ -3,12 +3,14 @@
 //! sibling with the impersonation flags in front and our headers
 //! stripped, an unmarked one execs the `curl` on PATH untouched, and one
 //! matching the desktop-proxy config execs that `curl` against the
-//! gateway. Both targets are fake scripts that print their argv.
+//! gateway of the most recently active desktop. Both targets are fake
+//! scripts that print their argv.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 const ROUTER: &str = env!("CARGO_BIN_EXE_latchkey-curl-router");
 
@@ -48,11 +50,33 @@ impl Sandbox {
         let mut command = Command::new(self.dir.join("latchkey-curl-router"));
         command.env_remove("DATALIB_IMPERSONATE_PROFILE");
         command.env_remove("LATCHKEY_DESKTOP_PROXY_CONFIG");
-        command.env_remove("LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL");
         command.env_remove("LATCHKEY_GATEWAY_LISTEN_PASSWORD");
-        command.env_remove("LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE");
-        command.env_remove("LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE");
+        command.env_remove("LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS");
+        // Never the real one: a desktop connected to the machine running
+        // the tests must not be where a test request goes.
+        command.env("LATCHKEY_EXTENSION_DEVICES_DIR", self.devices_dir());
         command
+    }
+
+    /// The sandbox's own device-records directory, created on first use.
+    fn devices_dir(&self) -> PathBuf {
+        let dir = self.dir.join("devices");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A device record for a desktop that last sent a keepalive `age`
+    /// seconds ago.
+    fn write_device_record(&self, device_id: &str, json: &str, age: Duration) -> PathBuf {
+        let path = self.devices_dir().join(format!("{device_id}.json"));
+        fs::write(&path, json).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+        path
     }
 
     /// A router whose PATH starts with the sandbox, so the fake `curl`
@@ -184,24 +208,24 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
         "desktop-proxy.json",
         r#"{"slack": true, "claude-ai": false}"#,
     );
+    // Two desktops are connected; the one that sent a keepalive most
+    // recently is where the request goes, secrets and all.
+    sandbox.write_device_record(
+        "mac-at-the-office",
+        r#"{"port": 40001, "gateway_password": "office", "permissions_override": "office.jwt"}"#,
+        Duration::from_secs(90),
+    );
+    sandbox.write_device_record(
+        "laptop-at-home",
+        r#"{"port": 40002, "gateway_password": "hunter2", "permissions_override": "override.jwt"}"#,
+        Duration::from_secs(20),
+    );
     let got = run(sandbox
         .router_with_fake_system_curl()
         .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
-        .env(
-            "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL",
-            "http://127.0.0.1:1988/",
-        )
         // The password the gateway running the router listens with is not
         // the desktop's, and must not be the one sent.
         .env("LATCHKEY_GATEWAY_LISTEN_PASSWORD", "the-machines-own")
-        .env(
-            "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE",
-            sandbox.write_file("desktop_password", "hunter2\n"),
-        )
-        .env(
-            "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE",
-            sandbox.write_file("desktop_permissions_override", "override.jwt\n"),
-        )
         .args([
             "-H",
             "X-Latchkey-Matched-Service: slack",
@@ -223,7 +247,35 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
             "-sS",
             "-H",
             "X-Imbue-Impersonate: 1",
-            "http://127.0.0.1:1988/gateway/https://slack.com/api/users.list",
+            "http://127.0.0.1:40002/gateway/https://slack.com/api/users.list",
+        ])
+    );
+
+    // A desktop whose record asks for no secrets gets none, and the
+    // window is the operator's to set: with a long enough one, the office
+    // desktop is active again once the laptop's record is gone.
+    fs::remove_file(sandbox.devices_dir().join("laptop-at-home.json")).unwrap();
+    sandbox.write_device_record(
+        "mac-at-the-office",
+        r#"{"port": 40001, "gateway_password": null}"#,
+        Duration::from_secs(90),
+    );
+    let got = run(sandbox
+        .router_with_fake_system_curl()
+        .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
+        .env("LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS", "100")
+        .args([
+            "-H",
+            "X-Latchkey-Matched-Service: slack",
+            "https://slack.com/api/users.list",
+        ]));
+    assert_eq!(
+        got,
+        lines(&[
+            "system-curl",
+            "-H",
+            "X-Latchkey-Gateway-No-Credentials: 1",
+            "http://127.0.0.1:40001/gateway/https://slack.com/api/users.list",
         ])
     );
 
@@ -237,10 +289,7 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
         None,
     ] {
         let mut command = sandbox.router_with_fake_system_curl();
-        command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config).env(
-            "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL",
-            "http://127.0.0.1:1988/",
-        );
+        command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config);
         if let Some(header) = matched_service_header {
             command.args(["-H", header]);
         }
@@ -266,15 +315,9 @@ fn desktop_proxy_config_that_cannot_be_used_is_an_error_not_a_direct_request() {
     let sandbox = Sandbox::new("desktop-proxy-errors");
     let malformed = sandbox.write_desktop_proxy_config("malformed.json", r#"["slack"]"#);
     let missing = sandbox.dir.join("does-not-exist.json");
-    let matched_without_gateway =
-        sandbox.write_desktop_proxy_config("matched.json", r#"{"slack": true}"#);
     for (config, needle) in [
         (malformed, "expected a JSON object"),
         (missing, "cannot read"),
-        (
-            matched_without_gateway,
-            "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL is not set",
-        ),
     ] {
         let output = sandbox
             .router_with_fake_system_curl()
@@ -296,42 +339,104 @@ fn desktop_proxy_config_that_cannot_be_used_is_an_error_not_a_direct_request() {
     }
 }
 
+/// A matched request with no desktop to send it to fails, whichever way
+/// the desktop is missing: no records at all, no directory, only a stale
+/// record, or a record that cannot name a gateway or hold its secret.
 #[test]
-fn desktop_gateway_secret_file_that_cannot_be_used_is_an_error_not_an_unauthenticated_request() {
-    let sandbox = Sandbox::new("desktop-proxy-secret-errors");
+fn desktop_that_cannot_be_reached_is_an_error_not_a_direct_request() {
+    /// One way for the desktop to be missing: the record to write (with
+    /// the age of its last keepalive), an env var to set, and what the
+    /// router must say about it.
+    struct Case {
+        name: &'static str,
+        record: Option<(&'static str, u64)>,
+        env: Option<(&'static str, String)>,
+        needle: &'static str,
+    }
+    let sandbox = Sandbox::new("desktop-errors");
     let config = sandbox.write_desktop_proxy_config("matched.json", r#"{"slack": true}"#);
-    let missing = sandbox.dir.join("does-not-exist");
-    let blank = sandbox.write_file("blank", " \n");
-    for env_name in [
-        "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE",
-        "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE",
-    ] {
-        for (secret_file, needle) in [(&missing, "cannot read"), (&blank, "is empty")] {
-            let output = sandbox
-                .router_with_fake_system_curl()
-                .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
-                .env(
-                    "LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL",
-                    "http://127.0.0.1:1988/",
-                )
-                .env(env_name, secret_file)
-                .args([
-                    "-H",
-                    "X-Latchkey-Matched-Service: slack",
-                    "https://slack.com/api/users.list",
-                ])
-                .output()
-                .unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert_eq!(output.status.code(), Some(2), "{env_name}: {stderr}");
-            assert!(
-                stderr.contains(env_name) && stderr.contains(needle),
-                "{env_name}: {stderr}"
-            );
-            assert!(
-                output.stdout.is_empty(),
-                "{env_name}: nothing should have been exec'd"
-            );
+    let no_such_dir = sandbox.dir.join("no-such-devices");
+    let cases = [
+        Case {
+            name: "no records",
+            record: None,
+            env: None,
+            needle: "no desktop is connected",
+        },
+        Case {
+            name: "no directory",
+            record: None,
+            env: Some((
+                "LATCHKEY_EXTENSION_DEVICES_DIR",
+                no_such_dir.to_str().unwrap().to_string(),
+            )),
+            needle: "no desktop is connected",
+        },
+        Case {
+            name: "stale record",
+            record: Some((r#"{"port": 40001}"#, 600)),
+            env: None,
+            needle: "no desktop is active",
+        },
+        Case {
+            name: "malformed window",
+            record: Some((r#"{"port": 40001}"#, 10)),
+            env: Some((
+                "LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS",
+                "soon".to_string(),
+            )),
+            needle: "LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS=soon",
+        },
+        Case {
+            name: "record without a port",
+            record: Some((r#"{"gateway_password": "x"}"#, 10)),
+            env: None,
+            needle: "\"port\" is not a TCP port number",
+        },
+        Case {
+            name: "record that is not JSON",
+            record: Some(("{", 10)),
+            env: None,
+            needle: "not JSON",
+        },
+        Case {
+            name: "record with an empty password",
+            record: Some((r#"{"port": 40001, "gateway_password": ""}"#, 10)),
+            env: None,
+            needle: "\"gateway_password\"",
+        },
+        Case {
+            name: "record with a non-string permissions override",
+            record: Some((r#"{"port": 40001, "permissions_override": 7}"#, 10)),
+            env: None,
+            needle: "\"permissions_override\"",
+        },
+    ];
+    for case in cases {
+        if let Some((json, age)) = case.record {
+            sandbox.write_device_record("desktop", json, Duration::from_secs(age));
         }
+        let mut command = sandbox.router_with_fake_system_curl();
+        if let Some((name, value)) = case.env {
+            command.env(name, value);
+        }
+        let output = command
+            .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
+            .args([
+                "-H",
+                "X-Latchkey-Matched-Service: slack",
+                "https://slack.com/api/users.list",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let name = case.name;
+        assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
+        assert!(stderr.contains(case.needle), "{name}: {stderr}");
+        assert!(
+            output.stdout.is_empty(),
+            "{name}: nothing should have been exec'd"
+        );
+        let _ = fs::remove_dir_all(sandbox.devices_dir());
     }
 }
