@@ -40,27 +40,28 @@ addressed to the `/gateway/<url>` endpoint of the latchkey gateway on
 that computer, with everything else in the invocation kept as it was.
 Which requests get this is a JSON file, and which computer they go to is
 decided per invocation from the device records the user's desktops keep
-on this machine. Three environment variables say where things are:
+on this machine. Two environment variables say where things are:
 
 | variable | meaning |
 |---|---|
 | `LATCHKEY_DESKTOP_PROXY_CONFIG` | Path of the config file. Unset or empty: nothing is proxied. Set but missing, unreadable or not a JSON object: every invocation fails with exit 2, since routing was asked for and is not happening. |
 | `LATCHKEY_EXTENSION_DEVICES_DIR` | Directory of device records, one `<device_id>.json` per connected desktop. Unset or empty: `/run/mngr-latchkey/devices`. |
-| `LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS` | How long a record may go untouched and still count as a connected desktop. Unset or empty: `180`. Set but not a positive whole number: exit 2. |
 
-The last two are the variables minds already gives the VPS gateway for
-its desktop-forwarding extension; the gateway runs the router as a
-child, so the router inherits them.
+The second is a variable minds already gives the VPS gateway for its
+desktop-forwarding extension; the gateway runs the router as a child, so
+the router inherits it.
 
 The user may be connected from several desktops at once, each with its
 own reverse tunnel into this machine's loopback on a port of its own.
 Each desktop writes a record when it connects and touches it with every
 keepalive, about once a minute, so the record modified most recently
 belongs to the desktop the user is at. That is the one a matched request
-goes to, looked up afresh on every invocation. A record older than the
-active window is a desktop that went away without cleaning up, and is
-not used. Only `.json` files count; two records touched in the same
-instant are ordered by name, so the choice is the same every time.
+goes to, looked up afresh on every invocation. How long ago it was
+touched is not checked: a desktop that went away without cleaning up
+leaves a record whose port nothing listens on, and the request fails
+there, as it did when the port was fixed. Only `.json` files count; two
+records touched in the same instant are ordered by name, so the choice
+is the same every time.
 
 ```json
 {
@@ -83,9 +84,8 @@ the VPS gateway itself listens with (`LATCHKEY_GATEWAY_LISTEN_PASSWORD`)
 is a different one and is not used.
 
 A matched request with no desktop to send it to fails with exit 2 rather
-than going out directly: no records, no directory, only stale records, or
-a newest record that cannot be read, is not a JSON object, or has no
-usable `port`. The operator asked for a different source address on
+than going out directly: no records, no directory, or a newest record
+that cannot be read, is not a JSON object, or has no usable `port`. The operator asked for a different source address on
 purpose, and a request from the wrong one is worse than none.
 
 The request is sent with `X-Latchkey-Gateway-No-Credentials: 1`. The

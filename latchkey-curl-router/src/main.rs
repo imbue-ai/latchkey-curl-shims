@@ -19,7 +19,7 @@
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::{Map, Value};
 
@@ -64,19 +64,6 @@ const DEFAULT_DESKTOP_DEVICES_DIR: &str = "/run/mngr-latchkey/devices";
 /// The extension of a device record: `<device_id>.json`. Anything else in
 /// the directory (a lock file, an editor backup) is not a record.
 const DESKTOP_DEVICE_RECORD_EXTENSION: &str = "json";
-
-/// Env var holding how long, in seconds, a device record may go untouched
-/// and still count as a connected desktop. A desktop that went away
-/// without cleaning up leaves its record behind, and its port leads
-/// nowhere; the window keeps a stale record from being chosen over an
-/// honest "no desktop is connected". Unset or empty:
-/// [`DEFAULT_DESKTOP_DEVICE_ACTIVE_WINDOW`]. Set but not a positive whole
-/// number: an error.
-const DESKTOP_DEVICE_ACTIVE_WINDOW_ENV: &str = "LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS";
-
-/// Three keepalive intervals: one missed keepalive is a hiccup, three is a
-/// gone desktop.
-const DEFAULT_DESKTOP_DEVICE_ACTIVE_WINDOW: Duration = Duration::from_secs(180);
 
 /// The record's key holding the loopback port the desktop's tunnel
 /// listens on here. The desktop gateway is reached as
@@ -321,15 +308,16 @@ impl DesktopGateway {
     /// is none, or when its record cannot be used: a matched request with
     /// no gateway to send it to is an error, not a silent direct request,
     /// since the operator asked for a different source address on purpose.
+    /// How recently is not checked: a desktop that went away without
+    /// cleaning up leaves a record whose port nothing listens on, and the
+    /// request fails there, the way it did when the port was fixed.
     fn from_env() -> Result<Self, String> {
         let devices_dir = match std::env::var(DESKTOP_DEVICES_DIR_ENV) {
             Ok(value) if !value.is_empty() => value,
             _ => DEFAULT_DESKTOP_DEVICES_DIR.to_string(),
         };
-        let active_window = active_window_from_env()?;
-        let record_path =
-            newest_device_record(Path::new(&devices_dir), active_window, SystemTime::now())
-                .map_err(|err| format!("request matches {DESKTOP_PROXY_CONFIG_ENV} but {err}"))?;
+        let record_path = newest_device_record(Path::new(&devices_dir))
+            .map_err(|err| format!("request matches {DESKTOP_PROXY_CONFIG_ENV} but {err}"))?;
         let text = std::fs::read_to_string(&record_path)
             .map_err(|err| format!("cannot read device record {}: {err}", record_path.display()))?;
         Self::parse(&text).map_err(|err| format!("device record {}: {err}", record_path.display()))
@@ -366,31 +354,13 @@ fn optional_secret(record: &Map<String, Value>, key: &str) -> Result<Option<Stri
     }
 }
 
-fn active_window_from_env() -> Result<Duration, String> {
-    let value = match std::env::var(DESKTOP_DEVICE_ACTIVE_WINDOW_ENV) {
-        Ok(value) if !value.is_empty() => value,
-        _ => return Ok(DEFAULT_DESKTOP_DEVICE_ACTIVE_WINDOW),
-    };
-    match value.trim().parse::<u64>() {
-        Ok(seconds) if seconds > 0 => Ok(Duration::from_secs(seconds)),
-        _ => Err(format!(
-            "{DESKTOP_DEVICE_ACTIVE_WINDOW_ENV}={value} is not a positive whole number of seconds"
-        )),
-    }
-}
-
-/// The path of the device record touched most recently, provided that was
-/// within `active_window` of `now`. Only files whose extension is
-/// [`DESKTOP_DEVICE_RECORD_EXTENSION`] count. A record that vanishes while
-/// the directory is being read is a desktop that just disconnected, and is
-/// skipped; any other trouble reading the directory is an error. Ties on
-/// the modification time go to the greater file name, so the choice is
-/// the same on every invocation.
-fn newest_device_record(
-    devices_dir: &Path,
-    active_window: Duration,
-    now: SystemTime,
-) -> Result<PathBuf, String> {
+/// The path of the device record touched most recently. Only files whose
+/// extension is [`DESKTOP_DEVICE_RECORD_EXTENSION`] count. A record that
+/// vanishes while the directory is being read is a desktop that just
+/// disconnected, and is skipped; any other trouble reading the directory
+/// is an error. Ties on the modification time go to the greater file
+/// name, so the choice is the same on every invocation.
+fn newest_device_record(devices_dir: &Path) -> Result<PathBuf, String> {
     let describe_dir = || format!("{DESKTOP_DEVICES_DIR_ENV}={}", devices_dir.display());
     let entries = std::fs::read_dir(devices_dir).map_err(|err| {
         format!(
@@ -433,24 +403,12 @@ fn newest_device_record(
             newest = Some((modified, path));
         }
     }
-    let Some((modified, path)) = newest else {
+    let Some((_, path)) = newest else {
         return Err(format!(
             "no desktop is connected: no device record in {}",
             describe_dir()
         ));
     };
-    // A record from the future (clock skew, a restored snapshot) was
-    // touched "just now" as far as we can tell.
-    let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-    if age > active_window {
-        return Err(format!(
-            "no desktop is active: the newest device record {} was last touched {}s ago, \
-             longer than {DESKTOP_DEVICE_ACTIVE_WINDOW_ENV}={}s",
-            path.display(),
-            age.as_secs(),
-            active_window.as_secs()
-        ));
-    }
     Ok(path)
 }
 
@@ -588,6 +546,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn argv(tokens: &[&str]) -> Vec<String> {
@@ -1240,8 +1200,8 @@ mod tests {
             path
         }
 
-        fn newest(&self, active_window: Duration) -> Result<PathBuf, String> {
-            newest_device_record(&self.dir, active_window, self.now)
+        fn newest(&self) -> Result<PathBuf, String> {
+            newest_device_record(&self.dir)
         }
     }
 
@@ -1261,7 +1221,7 @@ mod tests {
         devices.touch("aaa-first-connected.json", SECS(50));
         let current = devices.touch("mmm-current.json", SECS(5));
         devices.touch("zzz-idle.json", SECS(120));
-        assert_eq!(devices.newest(SECS(180)).unwrap(), current);
+        assert_eq!(devices.newest().unwrap(), current);
     }
 
     /// Only `<device_id>.json` files are records: a lock file, a backup
@@ -1274,7 +1234,7 @@ mod tests {
         devices.touch("mac-2.json~", SECS(0));
         devices.touch("notes.txt", SECS(0));
         std::fs::create_dir(devices.dir.join("nested.json")).unwrap();
-        assert_eq!(devices.newest(SECS(180)).unwrap(), record);
+        assert_eq!(devices.newest().unwrap(), record);
     }
 
     /// Two records touched in the same instant resolve the same way every
@@ -1284,43 +1244,28 @@ mod tests {
         let devices = DevicesDir::new("tie");
         devices.touch("a.json", SECS(10));
         let b = devices.touch("b.json", SECS(10));
-        assert_eq!(devices.newest(SECS(180)).unwrap(), b);
+        assert_eq!(devices.newest().unwrap(), b);
     }
 
-    /// A record older than the window is a desktop that went away without
-    /// cleaning up, not a gateway to send to; a record from the future is
-    /// as fresh as it gets.
+    /// How long ago the newest record was touched is not our concern: a
+    /// desktop that left its record behind is still the best guess, and
+    /// the request fails at its port rather than here.
     #[test]
-    fn a_record_older_than_the_window_means_no_active_desktop() {
-        let devices = DevicesDir::new("window");
-        devices.touch("stale.json", SECS(181));
-        let err = devices.newest(SECS(180)).expect_err("stale");
-        assert!(err.contains("no desktop is active"), "{err}");
-        assert!(err.contains("stale.json"), "{err}");
-
-        let fresh = devices.touch("fresh.json", SECS(180));
-        assert_eq!(devices.newest(SECS(180)).unwrap(), fresh);
-
-        let path = devices.dir.join("future.json");
-        std::fs::write(&path, "{}").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(devices.now + SECS(3600))
-            .unwrap();
-        assert_eq!(devices.newest(SECS(180)).unwrap(), path);
+    fn a_stale_record_is_still_chosen() {
+        let devices = DevicesDir::new("stale");
+        let stale = devices.touch("stale.json", SECS(30 * 24 * 3600));
+        assert_eq!(devices.newest().unwrap(), stale);
     }
 
     /// No records, or no directory at all, is "no desktop is connected".
     #[test]
     fn no_record_means_no_connected_desktop() {
         let devices = DevicesDir::new("empty");
-        let err = devices.newest(SECS(180)).expect_err("empty");
+        let err = devices.newest().expect_err("empty");
         assert!(err.contains("no desktop is connected"), "{err}");
 
         let missing = devices.dir.join("does-not-exist");
-        let err = newest_device_record(&missing, SECS(180), devices.now).expect_err("missing");
+        let err = newest_device_record(&missing).expect_err("missing");
         assert!(err.contains("no desktop is connected"), "{err}");
         assert!(err.contains("does-not-exist"), "{err}");
     }

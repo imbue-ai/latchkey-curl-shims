@@ -51,7 +51,6 @@ impl Sandbox {
         command.env_remove("DATALIB_IMPERSONATE_PROFILE");
         command.env_remove("LATCHKEY_DESKTOP_PROXY_CONFIG");
         command.env_remove("LATCHKEY_GATEWAY_LISTEN_PASSWORD");
-        command.env_remove("LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS");
         // Never the real one: a desktop connected to the machine running
         // the tests must not be where a test request goes.
         command.env("LATCHKEY_EXTENSION_DEVICES_DIR", self.devices_dir());
@@ -251,19 +250,18 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
         ])
     );
 
-    // A desktop whose record asks for no secrets gets none, and the
-    // window is the operator's to set: with a long enough one, the office
-    // desktop is active again once the laptop's record is gone.
+    // A desktop whose record asks for no secrets gets none, and how long
+    // ago it was last heard from does not matter: once the laptop's record
+    // is gone, the office desktop is the newest, however old.
     fs::remove_file(sandbox.devices_dir().join("laptop-at-home.json")).unwrap();
     sandbox.write_device_record(
         "mac-at-the-office",
         r#"{"port": 40001, "gateway_password": null}"#,
-        Duration::from_secs(90),
+        Duration::from_secs(3 * 24 * 3600),
     );
     let got = run(sandbox
         .router_with_fake_system_curl()
         .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
-        .env("LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS", "100")
         .args([
             "-H",
             "X-Latchkey-Matched-Service: slack",
@@ -340,8 +338,8 @@ fn desktop_proxy_config_that_cannot_be_used_is_an_error_not_a_direct_request() {
 }
 
 /// A matched request with no desktop to send it to fails, whichever way
-/// the desktop is missing: no records at all, no directory, only a stale
-/// record, or a record that cannot name a gateway or hold its secret.
+/// the desktop is missing: no records at all, no directory, or a record
+/// that cannot name a gateway or hold its secret.
 #[test]
 fn desktop_that_cannot_be_reached_is_an_error_not_a_direct_request() {
     /// One way for the desktop to be missing: the record to write (with
@@ -371,21 +369,6 @@ fn desktop_that_cannot_be_reached_is_an_error_not_a_direct_request() {
                 no_such_dir.to_str().unwrap().to_string(),
             )),
             needle: "no desktop is connected",
-        },
-        Case {
-            name: "stale record",
-            record: Some((r#"{"port": 40001}"#, 600)),
-            env: None,
-            needle: "no desktop is active",
-        },
-        Case {
-            name: "malformed window",
-            record: Some((r#"{"port": 40001}"#, 10)),
-            env: Some((
-                "LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS",
-                "soon".to_string(),
-            )),
-            needle: "LATCHKEY_EXTENSION_DEVICE_ACTIVE_WINDOW_SECONDS=soon",
         },
         Case {
             name: "record without a port",
