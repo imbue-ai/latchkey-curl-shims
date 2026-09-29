@@ -1,6 +1,6 @@
 [package]
 name = "latchkey-curl-router"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.83"
 description = "A drop-in curl that routes marked requests to a Chrome-impersonating curl"
@@ -8,6 +8,7 @@ repository = "https://github.com/imbue-ai/latchkey-curl-shims"
 publish = false
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [profile.release]

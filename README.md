@@ -38,23 +38,56 @@ A request can be made to leave from the user's own computer instead of
 the machine the router runs on: the router hands it to the system curl,
 addressed to the `/gateway/<url>` endpoint of the latchkey gateway on
 that computer, with everything else in the invocation kept as it was.
-Which requests get this is a JSON file, and four environment variables
-say where things are:
+Which requests get this is a JSON file, and which computer they go to is
+decided per invocation from the device records the user's desktops keep
+on this machine. Two environment variables say where things are:
 
 | variable | meaning |
 |---|---|
 | `LATCHKEY_DESKTOP_PROXY_CONFIG` | Path of the config file. Unset or empty: nothing is proxied. Set but missing, unreadable or not a JSON object: every invocation fails with exit 2, since routing was asked for and is not happening. |
-| `LATCHKEY_EXTENSION_DESKTOP_GATEWAY_URL` | Base URL of the desktop gateway as reachable from this machine. Required once a request matches. |
-| `LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PASSWORD_FILE` | Path of a file holding the desktop gateway's listen password, sent as `X-Latchkey-Gateway-Password`. Unset or empty: no password is sent. Set but unreadable or empty: exit 2. |
-| `LATCHKEY_EXTENSION_DESKTOP_GATEWAY_PERMISSIONS_OVERRIDE_FILE` | Path of a file holding a permissions-override JWT, sent as `X-Latchkey-Gateway-Permissions-Override`, so the desktop gateway checks the request against the permissions file the JWT names instead of its default one. Same unset and unreadable handling as the password file. |
+| `LATCHKEY_EXTENSION_DEVICES_DIR` | Directory of device records, one `<device_id>.json` per connected desktop. Unset or empty: `/run/mngr-latchkey/devices`. |
 
-All but the first are the variables minds already gives the VPS gateway
-for its desktop-forwarding extension; the gateway runs the router as a
-child, so the router inherits them. The secrets are files read on every
+The second is a variable minds already gives the VPS gateway for its
+desktop-forwarding extension; the gateway runs the router as a child, so
+the router inherits it.
+
+The user may be connected from several desktops at once, each with its
+own reverse tunnel into this machine's loopback on a port of its own.
+Each desktop writes a record when it connects and touches it with every
+keepalive, about once a minute, so the record modified most recently
+belongs to the desktop the user is at. That is the one a matched request
+goes to, looked up afresh on every invocation. How long ago it was
+touched is not checked: a desktop that went away without cleaning up
+leaves a record whose port nothing listens on, and the request fails
+there, as it did when the port was fixed. Only `.json` files count; two
+records touched in the same instant are ordered by name, so the choice
+is the same every time. A file whose metadata cannot be read is skipped
+with a warning on stderr rather than failing the request.
+
+```json
+{
+  "port": 41231,
+  "gateway_password": "...",
+  "permissions_override": "..."
+}
+```
+
+| key | meaning |
+|---|---|
+| `port` | Loopback port of the desktop's tunnel; the gateway is reached as `http://127.0.0.1:<port>`. Required: a whole number from 1 to 65535. |
+| `gateway_password` | The desktop gateway's listen password, sent as `X-Latchkey-Gateway-Password`. Absent or `null`: no password is sent. Anything but a non-empty string: exit 2. |
+| `permissions_override` | A permissions-override JWT, sent as `X-Latchkey-Gateway-Permissions-Override`, so the desktop gateway checks the request against the permissions file the JWT names instead of its default one. Same absent and invalid handling as the password. |
+
+Other keys are ignored. The secrets are read from the record on every
 invocation because they belong to whichever of the user's computers is
 connected, and change when the user moves to another one. The password
 the VPS gateway itself listens with (`LATCHKEY_GATEWAY_LISTEN_PASSWORD`)
 is a different one and is not used.
+
+A matched request with no desktop to send it to fails with exit 2 rather
+than going out directly: no records, no directory, or a newest record
+that cannot be read, is not a JSON object, or has no usable `port`. The operator asked for a different source address on
+purpose, and a request from the wrong one is worse than none.
 
 The request is sent with `X-Latchkey-Gateway-No-Credentials: 1`. The
 desktop gateway then injects nothing, since the gateway that ran the
