@@ -61,7 +61,8 @@ touched is not checked: a desktop that went away without cleaning up
 leaves a record whose port nothing listens on, and the request fails
 there, as it did when the port was fixed. Only `.json` files count; two
 records touched in the same instant are ordered by name, so the choice
-is the same every time.
+is the same every time. A file whose metadata cannot be read is skipped
+with a warning on stderr rather than failing the request.
 
 ```json
 {

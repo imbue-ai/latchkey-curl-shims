@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use serde_json::{Map, Value};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 
 /// Name of the private routing marker header. Namespaced so it can't
 /// collide with a header a caller legitimately wants to set or strip.
@@ -64,30 +66,6 @@ const DEFAULT_DESKTOP_DEVICES_DIR: &str = "/run/mngr-latchkey/devices";
 /// The extension of a device record: `<device_id>.json`. Anything else in
 /// the directory (a lock file, an editor backup) is not a record.
 const DESKTOP_DEVICE_RECORD_EXTENSION: &str = "json";
-
-/// The record's key holding the loopback port the desktop's tunnel
-/// listens on here. The desktop gateway is reached as
-/// `http://127.0.0.1:<port>`: a reverse tunnel lands on this machine's
-/// loopback and nowhere else.
-const DEVICE_RECORD_PORT_KEY: &str = "port";
-
-/// The record's key holding the password to send as
-/// [`GATEWAY_PASSWORD_HEADER_NAME`]: the desktop gateway's own listen
-/// password. It is not the password the gateway running us listens with.
-/// In minds that one is fixed by whichever of the user's computers created
-/// the workspace, while the desktop's belongs to the computer the record
-/// describes. Absent or `null`: no password header is sent, for a gateway
-/// that requires none. Present but not a non-empty string: an error, since
-/// the desktop asked for a secret to be sent and its gateway would refuse
-/// the request without it.
-const DEVICE_RECORD_PASSWORD_KEY: &str = "gateway_password";
-
-/// The record's key holding the JWT to send as
-/// [`GATEWAY_PERMISSIONS_OVERRIDE_HEADER_NAME`]. The desktop gateway checks
-/// a request against the permissions file this JWT names instead of its
-/// default one, which in minds denies everything. Same absent/invalid
-/// handling as [`DEVICE_RECORD_PASSWORD_KEY`].
-const DEVICE_RECORD_PERMISSIONS_OVERRIDE_KEY: &str = "permissions_override";
 
 /// The latchkey gateway's outbound-proxy endpoint: `<gateway>/gateway/<target-url>`.
 const GATEWAY_PATH_PREFIX: &str = "/gateway/";
@@ -132,6 +110,10 @@ const IMPERSONATE_STRIPPED_HEADERS: &[&str] = &[MARKER_HEADER_NAME, "User-Agent"
 fn die(msg: impl AsRef<str>) -> ! {
     eprintln!("latchkey-curl-router: {}", msg.as_ref());
     std::process::exit(2);
+}
+
+fn warn(msg: impl AsRef<str>) {
+    eprintln!("latchkey-curl-router: warning: {}", msg.as_ref());
 }
 
 fn is_header_named(header_argument: &str, name: &str) -> bool {
@@ -324,41 +306,82 @@ impl DesktopGateway {
     }
 
     fn parse(text: &str) -> Result<Self, String> {
-        let value: Value = serde_json::from_str(text).map_err(|err| format!("not JSON: {err}"))?;
-        let Value::Object(record) = value else {
-            return Err("expected a JSON object".to_string());
-        };
-        let port = match record.get(DEVICE_RECORD_PORT_KEY) {
-            Some(Value::Number(number)) => {
-                number.as_u64().filter(|port| (1..=65535).contains(port))
-            }
-            _ => None,
+        let record: DeviceRecord =
+            serde_json::from_str(text).map_err(|err| format!("not a device record: {err}"))?;
+        if record.port == 0 {
+            return Err("\"port\" is not a TCP port number".to_string());
         }
-        .ok_or_else(|| format!("{DEVICE_RECORD_PORT_KEY:?} is not a TCP port number"))?;
         Ok(Self {
-            base_url: format!("http://127.0.0.1:{port}"),
-            password: optional_secret(&record, DEVICE_RECORD_PASSWORD_KEY)?,
-            permissions_override: optional_secret(&record, DEVICE_RECORD_PERMISSIONS_OVERRIDE_KEY)?,
+            base_url: format!("http://127.0.0.1:{}", record.port),
+            password: record.gateway_password,
+            permissions_override: record.permissions_override,
         })
     }
 }
 
-/// The secret under `key` in a device record. `None` when the key is
-/// absent or `null`; an error when it holds anything but a non-empty
-/// string. The value itself is kept out of the message: it is a secret.
-fn optional_secret(record: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
-    match record.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(secret)) if !secret.is_empty() => Ok(Some(secret.clone())),
-        Some(_) => Err(format!("{key:?} is neither a non-empty string nor null")),
+/// A desktop's device record: `<device_id>.json`, written by minds. Keys
+/// not listed here are ignored.
+#[derive(Deserialize)]
+struct DeviceRecord {
+    /// The loopback port the desktop's tunnel listens on here. The desktop
+    /// gateway is reached as `http://127.0.0.1:<port>`: a reverse tunnel
+    /// lands on this machine's loopback and nowhere else.
+    port: u16,
+
+    /// The password to send as [`GATEWAY_PASSWORD_HEADER_NAME`]: the
+    /// desktop gateway's own listen password. It is not the password the
+    /// gateway running us listens with. In minds that one is fixed by
+    /// whichever of the user's computers created the workspace, while the
+    /// desktop's belongs to the computer the record describes. Absent or
+    /// `null`: no password header is sent, for a gateway that requires
+    /// none. Present but not a non-empty string: an error, since the
+    /// desktop asked for a secret to be sent and its gateway would refuse
+    /// the request without it.
+    #[serde(default, deserialize_with = "gateway_password_secret")]
+    gateway_password: Option<String>,
+
+    /// The JWT to send as [`GATEWAY_PERMISSIONS_OVERRIDE_HEADER_NAME`].
+    /// The desktop gateway checks a request against the permissions file
+    /// this JWT names instead of its default one, which in minds denies
+    /// everything. Same absent/invalid handling as `gateway_password`.
+    #[serde(default, deserialize_with = "permissions_override_secret")]
+    permissions_override: Option<String>,
+}
+
+fn gateway_password_secret<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    optional_secret(deserializer, "gateway_password")
+}
+
+fn permissions_override_secret<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    optional_secret(deserializer, "permissions_override")
+}
+
+/// A secret field of a device record: `None` for `null`, an error for
+/// anything but a non-empty string. serde's own message is replaced,
+/// since it quotes the value it rejected and the value is a secret.
+fn optional_secret<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    key: &str,
+) -> Result<Option<String>, D::Error> {
+    let invalid = || D::Error::custom(format!("{key:?} is neither a non-empty string nor null"));
+    match Option::<String>::deserialize(deserializer) {
+        Ok(Some(secret)) if secret.is_empty() => Err(invalid()),
+        Ok(secret) => Ok(secret),
+        Err(_) => Err(invalid()),
     }
 }
 
 /// The path of the device record touched most recently. Only files whose
 /// extension is [`DESKTOP_DEVICE_RECORD_EXTENSION`] count. A record that
 /// vanishes while the directory is being read is a desktop that just
-/// disconnected, and is skipped; any other trouble reading the directory
-/// is an error. Ties on the modification time go to the greater file
+/// disconnected, and is skipped silently; one that cannot be stat'ed for
+/// another reason is skipped with a warning, so one odd file does not
+/// cut off every desktop. Trouble listing the directory itself is an
+/// error. Ties on the modification time go to the greater file
 /// name, so the choice is the same on every invocation.
 fn newest_device_record(devices_dir: &Path) -> Result<PathBuf, String> {
     let describe_dir = || format!("{DESKTOP_DEVICES_DIR_ENV}={}", devices_dir.display());
@@ -379,21 +402,26 @@ fn newest_device_record(devices_dir: &Path) -> Result<PathBuf, String> {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
-                return Err(format!(
-                    "cannot stat device record {}: {err}",
+                warn(format!(
+                    "skipping device record {}: cannot stat it: {err}",
                     path.display()
-                ))
+                ));
+                continue;
             }
         };
         if !metadata.is_file() {
             continue;
         }
-        let modified = metadata.modified().map_err(|err| {
-            format!(
-                "cannot read the modification time of {}: {err}",
-                path.display()
-            )
-        })?;
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(err) => {
+                warn(format!(
+                    "skipping device record {}: cannot read its modification time: {err}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
         if newest
             .as_ref()
             .is_none_or(|(newest_modified, newest_path)| {

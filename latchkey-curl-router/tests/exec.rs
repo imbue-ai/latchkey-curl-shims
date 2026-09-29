@@ -374,13 +374,13 @@ fn desktop_that_cannot_be_reached_is_an_error_not_a_direct_request() {
             name: "record without a port",
             record: Some((r#"{"gateway_password": "x"}"#, 10)),
             env: None,
-            needle: "\"port\" is not a TCP port number",
+            needle: "missing field `port`",
         },
         Case {
             name: "record that is not JSON",
             record: Some(("{", 10)),
             env: None,
-            needle: "not JSON",
+            needle: "not a device record",
         },
         Case {
             name: "record with an empty password",
