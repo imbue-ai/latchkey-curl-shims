@@ -7,7 +7,7 @@ expects:
 
 | binary | what it is |
 |---|---|
-| `latchkey-curl-router` | The `curl` that `LATCHKEY_CURL` points at. A small Rust program: an invocation for a service listed in the desktop-proxy config (below) is rewritten onto the latchkey gateway on the user's own computer. Otherwise, an invocation carrying the private `X-Imbue-Impersonate` header is rewritten (that header and any `User-Agent` dropped, `--compressed --noproxy '*' --impersonate <profile>` put in front) and handed to the impersonating curl next to it. Anything else goes to the system `curl` untouched. |
+| `latchkey-curl-router` | The `curl` that `LATCHKEY_CURL` points at. A small Rust program: an invocation whose service's desktop-proxy rules (below) name a connected desktop is rewritten onto the latchkey gateway on that computer. Otherwise, an invocation carrying the private `X-Imbue-Impersonate` header is rewritten (that header and any `User-Agent` dropped, `--compressed --noproxy '*' --impersonate <profile>` put in front) and handed to the impersonating curl next to it. Anything else goes to the system `curl` untouched. |
 | `curl-impersonate` | Upstream [curl-impersonate](https://github.com/lexiforest/curl-impersonate), unmodified: a curl with a patched BoringSSL and a built-in `--impersonate <browser>` flag that presents Chrome's TLS and HTTP/2 fingerprint. **On its own it does not impersonate**: without `--impersonate` it is a plain curl 8.x and gets the same `403` a stock curl does. The router is what adds the flag. |
 
 Some of the hosts datalib mirrors, `claude.ai` and `chatgpt.com` today,
@@ -34,13 +34,15 @@ one.
 
 ## The desktop proxy
 
-A request can be made to leave from the user's own computer instead of
-the machine the router runs on: the router hands it to the system curl,
-addressed to the `/gateway/<url>` endpoint of the latchkey gateway on
-that computer, with everything else in the invocation kept as it was.
-Which requests get this is a JSON file, and which computer they go to is
-decided per invocation from the device records the user's desktops keep
-on this machine. Two environment variables say where things are:
+A request can be made to leave from one of the user's own computers
+instead of from the machine the router runs on: the router hands it to
+the system curl, addressed to the `/gateway/<url>` endpoint of the
+latchkey gateway on that computer, with everything else in the
+invocation kept as it was. Which requests get this, and from which
+computers, is a JSON file of rules; which of those computers is
+connected right now is decided per invocation from the device records
+the user's desktops keep on this machine. Two environment variables say
+where things are:
 
 | variable | meaning |
 |---|---|
@@ -51,18 +53,104 @@ The second is a variable minds already gives the VPS gateway for its
 desktop-forwarding extension; the gateway runs the router as a child, so
 the router inherits it.
 
+### The rules
+
+The file holds one object. Each key is a latchkey service name and each
+value is that service's rules: an ordered list of the places its
+requests may leave from.
+
+```json
+{
+  "slack": ["self"],
+  "github": ["desktop-id-1", "desktop-id-2"],
+  "gitlab": ["desktop-id-1", "desktop-id-2", "self"]
+}
+```
+
+A rule is one of two things:
+
+| rule | meaning |
+|---|---|
+| `self` | This machine's own egress: the request goes out from here, the way an unproxied one does. |
+| anything else | One desktop, by the device id its record is named after. |
+
+**Every rule names the device it is about.** There is no "any desktop"
+rule: a permission is granted to one device, so a rule that let the
+request go to whichever computer the user happened to be at would be
+asking for a permission it cannot name.
+
+The rules are tried in order and the first one that is satisfied carries
+the request. **Tried** means only "is it connected": the request is sent
+once, to the first desktop the rules reach, and a failure there is a
+failed request, not a reason to try the next rule. `self` needs nothing
+to be connected, so it is always satisfied and no rule after it is ever
+reached.
+
+**The implicit default is `["self"]`**, so a service that leaves from
+here needs no entry at all; the examples above spell `slack` out only to
+show the form. A service the file does not mention, a request latchkey
+matched to no service, and every request when
+`LATCHKEY_DESKTOP_PROXY_CONFIG` is unset all go out from this machine.
+An empty list, `[]`, is the opposite: nowhere to go, so those requests
+fail.
+
+A bare string is read as a one-rule list (`"github": "desktop-id-1"`). A
+rule that is not a string, or is the empty string, fails every
+invocation with exit 2: a config that does not mean what it says would
+send requests from the wrong address.
+
+**The old config still works.** It gave each service one JavaScript
+value and could say only "proxied" or "not". A falsy one (`false`, `0`,
+`""`, `null`) is read as `["self"]`, and a truthy one keeps doing what it
+did: the request goes to whichever desktop is connected, the one seen
+most recently when several are. No rule can ask for that, since it names
+no device; it is kept only so a file written before this format is not
+broken by it, and such a file should be rewritten to name devices. The
+one thing that did change for it is the three-minute window below — a
+desktop whose keepalives stopped is no longer chosen, where before the
+request went to its port and failed there.
+
+### Naming the desktop in the request
+
+A caller can pick among the desktops the rules allow with an
+`X-Latchkey-Device` header, whose value is one device id:
+
+```sh
+latchkey curl -sS -H 'X-Latchkey-Device: desktop-id-2' https://slack.com/api/users.list
+```
+
+The header replaces the walk through the rules, but not the rules
+themselves: one of them must name the desktop it asks for, wherever that
+rule sits in the order. A desktop no rule names is refused with exit 2,
+and so is a value that is not the id of a device with a record here: a
+wildcard like `*`, a list of ids, a rule name, an empty value. How long
+ago that desktop was last heard from is then not checked, since the
+caller named it on purpose. Like latchkey's own header, every occurrence
+is dropped from the invocation before curl runs.
+
+Under the old config's truthy value the header is the only way to choose
+at all, and it accepts any connected desktop, since that value already
+allowed every one of them.
+
+### The device records
+
 The user may be connected from several desktops at once, each with its
 own reverse tunnel into this machine's loopback on a port of its own.
 Each desktop writes a record when it connects and touches it with every
-keepalive, about once a minute, so the record modified most recently
-belongs to the desktop the user is at. That is the one a matched request
-goes to, looked up afresh on every invocation. How long ago it was
-touched is not checked: a desktop that went away without cleaning up
-leaves a record whose port nothing listens on, and the request fails
-there, as it did when the port was fixed. Only `.json` files count; two
-records touched in the same instant are ordered by name, so the choice
-is the same every time. A file whose metadata cannot be read is skipped
-with a warning on stderr rather than failing the request.
+keepalive, about once a minute, so a record touched in the last **three
+minutes** is a desktop still there, and the one touched most recently is
+the desktop the user is at. Both are looked up afresh on every
+invocation. A record older than that is a desktop that went away,
+perhaps without cleaning up, and no rule is satisfied by it — which is
+what lets the rule after it, another desktop or `self`, take the
+request. The record's name without `.json` is the device id rules name it
+by; only `.json` files count, and `self.json` is ignored, since no rule
+could name it. Two records touched in the same
+instant are ordered by name, so the choice is the same every time. A
+file whose metadata cannot be read is skipped with a warning on stderr
+rather than failing the request, and so is the whole directory when it
+cannot be listed: no desktop is seen, which is a thing the rules have an
+answer for.
 
 ```json
 {
@@ -84,10 +172,12 @@ connected, and change when the user moves to another one. The password
 the VPS gateway itself listens with (`LATCHKEY_GATEWAY_LISTEN_PASSWORD`)
 is a different one and is not used.
 
-A matched request with no desktop to send it to fails with exit 2 rather
-than going out directly: no records, no directory, or a newest record
-that cannot be read, is not a JSON object, or has no usable `port`. The operator asked for a different source address on
-purpose, and a request from the wrong one is worse than none.
+A request whose rules call for a desktop and find none fails with exit 2
+rather than going out directly, and so does one whose chosen record
+cannot be read, is not a JSON object or has no usable `port`. The
+operator asked for a different source address on purpose, and a request
+from the wrong one is worse than none. Writing `self` at the end of the
+rules is how that request is allowed out from here instead.
 
 The request is sent with `X-Latchkey-Gateway-No-Credentials: 1`. The
 desktop gateway then injects nothing, since the gateway that ran the
@@ -95,18 +185,6 @@ router already did, but it still runs its permission check, and it
 refuses the header with a `403` unless it runs with
 `LATCHKEY_PASSTHROUGH_UNKNOWN`. Its check sees no `account` metadata, so
 a rule allowing these requests cannot be an account-scoped one.
-
-The file holds one object. Each key is a latchkey service name and each
-value is anything; a request is proxied when latchkey matched it to a
-service whose value is truthy in the JavaScript sense (not `false`, `0`,
-`""` or `null`).
-
-```json
-{
-  "slack": true,
-  "github": false
-}
-```
 
 The router does not match URLs itself. Latchkey decides which service a
 URL belongs to, by prefix or by pattern, and reports it in the

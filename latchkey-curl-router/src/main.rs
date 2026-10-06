@@ -3,8 +3,12 @@
 //! different destination. Impersonation is asked for by a private marker
 //! header in the arguments; the desktop proxy is chosen by looking up the
 //! service latchkey matched the request to, which it reports in another
-//! header, in a config file named in the environment, and the desktop it
-//! goes to is the one whose device record was touched last. It exists
+//! header, in a config file named in the environment. That file gives each
+//! service an ordered list of rules — a device id, or `self` — and the
+//! request leaves from the first of them that a connected desktop
+//! satisfies; `self` is this machine, and is what a service the config
+//! says nothing about gets. A caller can name one of the desktops the
+//! rules admit outright, with an `X-Latchkey-Device` header. It exists
 //! so a single `LATCHKEY_CURL` binary can serve impersonating and
 //! non-impersonating callers alike without breaking the latter: only
 //! callers that opt in get the Chrome-impersonating curl; everyone else
@@ -16,10 +20,11 @@
 //! turns that flag on, so an impersonating invocation is rewritten, not
 //! forwarded verbatim; see [`impersonate_args`].
 
+use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
@@ -29,13 +34,12 @@ use serde_json::Value;
 /// collide with a header a caller legitimately wants to set or strip.
 const MARKER_HEADER_NAME: &str = "X-Imbue-Impersonate";
 
-/// Env var naming the JSON file that says which requests leave from the
-/// user's own computer rather than from this machine. The file holds one
-/// object; each key is a latchkey service name, and a request latchkey
-/// matched to a service whose value is truthy (in the JavaScript sense: not
-/// `false`, `0`, `""` or `null`) is routed through the desktop proxy. Unset
-/// or empty: nothing is proxied. Set but unreadable or malformed: an error,
-/// since the operator asked for routing they are not getting.
+/// Env var naming the JSON file that says which requests leave from one of
+/// the user's own computers rather than from this machine. The file holds
+/// one object; each key is a latchkey service name and each value is that
+/// service's rules, an ordered list of [`ProxyTerm`]s. Unset or empty:
+/// nothing is proxied. Set but unreadable or malformed: an error, since the
+/// operator asked for routing they are not getting.
 const DESKTOP_PROXY_CONFIG_ENV: &str = "LATCHKEY_DESKTOP_PROXY_CONFIG";
 
 /// The header latchkey reports the matched service in, when it runs with
@@ -46,6 +50,19 @@ const DESKTOP_PROXY_CONFIG_ENV: &str = "LATCHKEY_DESKTOP_PROXY_CONFIG";
 /// first occurrence is the one read. The header is for us alone: every
 /// occurrence is dropped before curl runs.
 const MATCHED_SERVICE_HEADER_NAME: &str = "X-Latchkey-Matched-Service";
+
+/// The header a caller names the desktop it wants in, in place of the
+/// choice the service's rules would otherwise make. The value is one
+/// device id and nothing else: a list, a wildcard, a rule name or any
+/// other string that is not the id of a desktop with a record here is
+/// refused, and so is a desktop the service's rules do not admit. The
+/// header is for us alone: every occurrence is dropped before curl runs.
+const DESKTOP_DEVICE_HEADER_NAME: &str = "X-Latchkey-Device";
+
+/// The headers addressed to us rather than to curl: read before anything
+/// is routed and dropped from every invocation, whichever route it takes,
+/// so they reach neither the desktop gateway nor the third party.
+const ROUTER_ONLY_HEADERS: &[&str] = &[MATCHED_SERVICE_HEADER_NAME, DESKTOP_DEVICE_HEADER_NAME];
 
 /// Env var naming the directory of device records: one JSON file per
 /// desktop connected to this machine, written by the desktop itself when
@@ -66,6 +83,15 @@ const DEFAULT_DESKTOP_DEVICES_DIR: &str = "/run/mngr-latchkey/devices";
 /// The extension of a device record: `<device_id>.json`. Anything else in
 /// the directory (a lock file, an editor backup) is not a record.
 const DESKTOP_DEVICE_RECORD_EXTENSION: &str = "json";
+
+/// How long after its last keepalive a desktop still counts as connected,
+/// and so as one a rule can be satisfied by. A desktop touches its record
+/// with every keepalive, about once a minute, so this is a few missed
+/// ones: long enough that a desktop which is merely busy keeps its turn,
+/// short enough that one which went away without cleaning up stops taking
+/// the requests a later rule — another desktop, or `self` — can still
+/// carry.
+const DESKTOP_ACTIVE_WINDOW: Duration = Duration::from_secs(180);
 
 /// The latchkey gateway's outbound-proxy endpoint: `<gateway>/gateway/<target-url>`.
 const GATEWAY_PATH_PREFIX: &str = "/gateway/";
@@ -186,11 +212,86 @@ fn without_headers(argv: &[String], names: &[&str]) -> Vec<String> {
     kept
 }
 
-/// The latchkey services whose requests go through the desktop proxy: the
-/// keys of the config file with a truthy value.
+/// One rule: a place a request is allowed to leave from. A service's
+/// rules are an ordered list of these, and the first one a connected
+/// desktop satisfies is the one that carries the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProxyTerm {
+    /// This machine's own egress: the request goes out from here, the way
+    /// an unproxied one always has. Nothing has to be connected for this
+    /// rule to be satisfied, so no rule after it is ever reached.
+    SelfEgress,
+    /// One desktop, named by the device id its record is called after.
+    Device(String),
+    /// Whichever desktop is connected; the one seen most recently when
+    /// several are. **No rule means this**: it is only what the old
+    /// config's truthy value is read as, since that value named no device
+    /// and this is what it did. A desktop reached this way is whichever
+    /// one the user happens to be at, which is why a rule names a device
+    /// instead — a permission is granted to one device, so the device has
+    /// to be the one the config chose.
+    AnyConnectedDesktop,
+}
+
+/// How [`ProxyTerm::SelfEgress`] is written in the config. A device
+/// record under this name is ignored, since no rule could name it.
+const SELF_TERM: &str = "self";
+
+impl ProxyTerm {
+    fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            SELF_TERM => Ok(Self::SelfEgress),
+            "" => Err(format!(
+                "a rule is {SELF_TERM:?} or a device id, not an empty string"
+            )),
+            device_id => Ok(Self::Device(device_id.to_string())),
+        }
+    }
+
+    /// Whether this rule lets `device_id` carry a request. This is what
+    /// the [`DESKTOP_DEVICE_HEADER_NAME`] override is checked against: a
+    /// desktop the caller names is admissible when any one of the
+    /// service's rules admits it, wherever that rule sits in the order
+    /// and whatever the rules before it would have chosen.
+    fn admits(&self, device_id: &str) -> bool {
+        match self {
+            Self::SelfEgress => false,
+            Self::Device(id) => id == device_id,
+            // The old config's truthy value would have sent the request
+            // to whichever desktop was connected, so naming one of them
+            // asks for no more than it already allowed.
+            Self::AnyConnectedDesktop => true,
+        }
+    }
+}
+
+impl std::fmt::Display for ProxyTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelfEgress => f.write_str(SELF_TERM),
+            Self::Device(device_id) => f.write_str(device_id),
+            Self::AnyConnectedDesktop => f.write_str("<any connected desktop>"),
+        }
+    }
+}
+
+/// A list of rules as the config would have written it, for the error
+/// message of a request they leave nowhere to go.
+fn describe_terms(terms: &[ProxyTerm]) -> String {
+    let written: Vec<String> = terms.iter().map(ProxyTerm::to_string).collect();
+    format!("[{}]", written.join(", "))
+}
+
+/// The rules of a service the config says nothing about, and of every
+/// service when there is no config at all: out from this machine. It is
+/// the implicit default, so it never has to be written down.
+static DEFAULT_PROXY_TERMS: [ProxyTerm; 1] = [ProxyTerm::SelfEgress];
+
+/// Where each latchkey service's requests may leave from: the config
+/// file, one list of rules per service name.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DesktopProxyRules {
-    service_names: Vec<String>,
+    services: BTreeMap<String, Vec<ProxyTerm>>,
 }
 
 impl DesktopProxyRules {
@@ -213,17 +314,47 @@ impl DesktopProxyRules {
         let Value::Object(entries) = value else {
             return Err("expected a JSON object with latchkey service names as keys".to_string());
         };
-        Ok(Self {
-            service_names: entries
-                .into_iter()
-                .filter(|(_, value)| is_truthy(value))
-                .map(|(service_name, _)| service_name)
-                .collect(),
-        })
+        let mut services = BTreeMap::new();
+        for (service_name, value) in entries {
+            let terms = parse_terms(&value)
+                .map_err(|err| format!("rules for service {service_name:?}: {err}"))?;
+            services.insert(service_name, terms);
+        }
+        Ok(Self { services })
     }
 
-    fn matches(&self, service_name: &str) -> bool {
-        self.service_names.iter().any(|name| name == service_name)
+    /// The rules for `service_name`, which are [`DEFAULT_PROXY_TERMS`]
+    /// when the config does not mention it. A service name is matched
+    /// whole and as written: latchkey's names are case-sensitive
+    /// identifiers, and one may be a prefix of another (`fastmail`,
+    /// `fastmail-dav`).
+    fn terms_for(&self, service_name: &str) -> &[ProxyTerm] {
+        self.services
+            .get(service_name)
+            .map_or(DEFAULT_PROXY_TERMS.as_slice(), Vec::as_slice)
+    }
+}
+
+/// One service's value in the config. A list is the rules themselves, and
+/// a non-empty string is a one-rule list.
+///
+/// Anything else is the old config, which held one JavaScript value per
+/// service and could only say "proxied" or "not": a truthy one becomes
+/// [`ProxyTerm::AnyConnectedDesktop`], which is what it did and which no
+/// rule can ask for, and a falsy one — `false`, `0`, `""`, `null` —
+/// becomes `[self]`.
+fn parse_terms(value: &Value) -> Result<Vec<ProxyTerm>, String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(text) => ProxyTerm::parse(text),
+                other => Err(format!("a rule is a string, not {other}")),
+            })
+            .collect(),
+        Value::String(text) if !text.is_empty() => Ok(vec![ProxyTerm::parse(text)?]),
+        legacy if is_truthy(legacy) => Ok(vec![ProxyTerm::AnyConnectedDesktop]),
+        _ => Ok(vec![ProxyTerm::SelfEgress]),
     }
 }
 
@@ -250,32 +381,29 @@ fn request_url(argv: &[String]) -> Option<&str> {
 /// Where an invocation goes; see the module docs for the order.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
-    /// Rewritten onto the desktop latchkey gateway and run by the system
-    /// curl.
-    DesktopProxy,
+    /// Rewritten onto this desktop's latchkey gateway and run by the
+    /// system curl.
+    DesktopProxy(DesktopGateway),
     /// Handed to the Chrome-impersonating curl.
     Impersonate,
     /// Handed to the system curl.
     SystemCurl,
 }
 
-fn choose_route(argv: &[String], desktop_proxy: Option<&DesktopProxyRules>) -> Route {
-    // The desktop proxy is decided first: a request that also carries the
-    // impersonation marker must keep it for the desktop gateway's own
-    // curl, which the impersonator here would strip.
-    let proxied = header_value(argv, MATCHED_SERVICE_HEADER_NAME)
-        .is_some_and(|service_name| desktop_proxy.is_some_and(|rules| rules.matches(service_name)));
-    if proxied {
-        Route::DesktopProxy
-    } else if has_header(argv, MARKER_HEADER_NAME) {
-        Route::Impersonate
-    } else {
-        Route::SystemCurl
+/// The desktop proxy is decided first, by [`plan_desktop_proxy`]: a
+/// request that also carries the impersonation marker must keep it for
+/// the desktop gateway's own curl, which the impersonator here would
+/// strip.
+fn choose_route(argv: &[String], gateway: Option<DesktopGateway>) -> Route {
+    match gateway {
+        Some(gateway) => Route::DesktopProxy(gateway),
+        None if has_header(argv, MARKER_HEADER_NAME) => Route::Impersonate,
+        None => Route::SystemCurl,
     }
 }
 
-/// The desktop latchkey gateway a matched request is sent to: the
-/// desktop whose device record was touched most recently.
+/// The desktop latchkey gateway a matched request is sent to, read from
+/// the record of the desktop the rules chose.
 #[derive(Debug, PartialEq, Eq)]
 struct DesktopGateway {
     /// Base URL without a trailing slash, so the endpoint path can be
@@ -286,23 +414,14 @@ struct DesktopGateway {
 }
 
 impl DesktopGateway {
-    /// The gateway of the most recently active desktop. An error when there
-    /// is none, or when its record cannot be used: a matched request with
-    /// no gateway to send it to is an error, not a silent direct request,
-    /// since the operator asked for a different source address on purpose.
-    /// How recently is not checked: a desktop that went away without
-    /// cleaning up leaves a record whose port nothing listens on, and the
-    /// request fails there, the way it did when the port was fixed.
-    fn from_env() -> Result<Self, String> {
-        let devices_dir = match std::env::var(DESKTOP_DEVICES_DIR_ENV) {
-            Ok(value) if !value.is_empty() => value,
-            _ => DEFAULT_DESKTOP_DEVICES_DIR.to_string(),
-        };
-        let record_path = newest_device_record(Path::new(&devices_dir))
-            .map_err(|err| format!("request matches {DESKTOP_PROXY_CONFIG_ENV} but {err}"))?;
-        let text = std::fs::read_to_string(&record_path)
-            .map_err(|err| format!("cannot read device record {}: {err}", record_path.display()))?;
-        Self::parse(&text).map_err(|err| format!("device record {}: {err}", record_path.display()))
+    /// The gateway a desktop's record names. An error when the record
+    /// cannot be used: a request the rules sent to a desktop is not
+    /// quietly let out from here instead, since the operator asked for a
+    /// different source address on purpose.
+    fn from_record(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| format!("cannot read device record {}: {err}", path.display()))?;
+        Self::parse(&text).map_err(|err| format!("device record {}: {err}", path.display()))
     }
 
     fn parse(text: &str) -> Result<Self, String> {
@@ -375,29 +494,83 @@ fn optional_secret<'de, D: Deserializer<'de>>(
     }
 }
 
-/// The path of the device record touched most recently. Only files whose
-/// extension is [`DESKTOP_DEVICE_RECORD_EXTENSION`] count. A record that
-/// vanishes while the directory is being read is a desktop that just
-/// disconnected, and is skipped silently; one that cannot be stat'ed for
-/// another reason is skipped with a warning, so one odd file does not
-/// cut off every desktop. Trouble listing the directory itself is an
-/// error. Ties on the modification time go to the greater file
-/// name, so the choice is the same on every invocation.
-fn newest_device_record(devices_dir: &Path) -> Result<PathBuf, String> {
+/// A desktop with a record in the devices directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Desktop {
+    /// The record's name without `.json`: the device id a rule, and the
+    /// [`DESKTOP_DEVICE_HEADER_NAME`] override, name this desktop by.
+    device_id: String,
+    path: PathBuf,
+    /// Whether its last keepalive is recent enough for the desktop to
+    /// count as connected; see [`DESKTOP_ACTIVE_WINDOW`].
+    active: bool,
+}
+
+/// The directory of device records: [`DESKTOP_DEVICES_DIR_ENV`], or
+/// [`DEFAULT_DESKTOP_DEVICES_DIR`] when it says nothing.
+fn desktop_devices_dir() -> PathBuf {
+    match std::env::var(DESKTOP_DEVICES_DIR_ENV) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => PathBuf::from(DEFAULT_DESKTOP_DEVICES_DIR),
+    }
+}
+
+/// Every desktop with a record in `devices_dir`, the one touched most
+/// recently first; ties go to the greater device id, so the order is the
+/// same on every invocation. Only files whose extension is
+/// [`DESKTOP_DEVICE_RECORD_EXTENSION`] count.
+///
+/// A record that vanishes while the directory is being read is a desktop
+/// that just disconnected, and is skipped silently; one that cannot be
+/// stat'ed, or whose name is not a usable device id, is skipped with a
+/// warning, so one odd file does not cut off every desktop. Trouble with
+/// the directory itself is a warning too rather than an error: it means
+/// no desktop can be seen, which is a thing the rules have an answer for
+/// — a desktop is no more reachable than if its record were missing, and
+/// `self` is still reachable.
+fn list_desktops(devices_dir: &Path, now: SystemTime) -> Vec<Desktop> {
     let describe_dir = || format!("{DESKTOP_DEVICES_DIR_ENV}={}", devices_dir.display());
-    let entries = std::fs::read_dir(devices_dir).map_err(|err| {
-        format!(
-            "no desktop is connected: cannot list {}: {err}",
-            describe_dir()
-        )
-    })?;
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    let entries = match std::fs::read_dir(devices_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn(format!(
+                "no desktop can be seen: cannot list {}: {err}",
+                describe_dir()
+            ));
+            return Vec::new();
+        }
+    };
+    let mut found: Vec<(SystemTime, Desktop)> = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|err| format!("cannot list {}: {err}", describe_dir()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn(format!(
+                    "skipping a device record: cannot list {}: {err}",
+                    describe_dir()
+                ));
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some(DESKTOP_DEVICE_RECORD_EXTENSION) {
             continue;
         }
+        let Some(device_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            warn(format!(
+                "skipping device record {}: its name is not a device id",
+                path.display()
+            ));
+            continue;
+        };
+        if device_id == SELF_TERM {
+            warn(format!(
+                "skipping device record {}: {device_id:?} is the name of a rule, not a device id",
+                path.display()
+            ));
+            continue;
+        }
+        let device_id = device_id.to_string();
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -422,22 +595,116 @@ fn newest_device_record(devices_dir: &Path) -> Result<PathBuf, String> {
                 continue;
             }
         };
-        if newest
-            .as_ref()
-            .is_none_or(|(newest_modified, newest_path)| {
-                (modified, &path) > (*newest_modified, newest_path)
-            })
-        {
-            newest = Some((modified, path));
+        let active = match now.duration_since(modified) {
+            Ok(since_keepalive) => since_keepalive <= DESKTOP_ACTIVE_WINDOW,
+            // Touched in the future: a clock that moved, not a desktop
+            // that is gone.
+            Err(_) => true,
+        };
+        found.push((
+            modified,
+            Desktop {
+                device_id,
+                path,
+                active,
+            },
+        ));
+    }
+    found.sort_by(|(left_modified, left), (right_modified, right)| {
+        (right_modified, &right.device_id).cmp(&(left_modified, &left.device_id))
+    });
+    found.into_iter().map(|(_, desktop)| desktop).collect()
+}
+
+/// The desktop a request leaves from, or `None` for this machine's own
+/// egress. The rules are walked in order and the first one a connected
+/// desktop satisfies wins; `requested_device`, the caller's
+/// [`DESKTOP_DEVICE_HEADER_NAME`], replaces that walk with the desktop it
+/// names, as long as the rules admit that desktop and it has a record
+/// here. How long ago that desktop was last heard from is then not
+/// checked: the caller named it on purpose, and the request fails at its
+/// port rather than here, the way it did when the desktop was never
+/// chosen by rule.
+///
+/// An error when the rules call for a desktop and none of them can be
+/// satisfied, or when the named desktop is not one the caller may have:
+/// such a request is not quietly let out from this machine instead.
+fn choose_desktop<'a>(
+    terms: &[ProxyTerm],
+    desktops: &'a [Desktop],
+    requested_device: Option<&str>,
+) -> Result<Option<&'a Desktop>, String> {
+    if let Some(device_id) = requested_device {
+        if !terms.iter().any(|term| term.admits(device_id)) {
+            return Err(format!(
+                "{DESKTOP_DEVICE_HEADER_NAME}: {device_id:?} is not a desktop these rules allow: {}",
+                describe_terms(terms)
+            ));
+        }
+        let Some(desktop) = desktops.iter().find(|d| d.device_id == device_id) else {
+            return Err(format!(
+                "{DESKTOP_DEVICE_HEADER_NAME}: {device_id:?} is not the id of a known device"
+            ));
+        };
+        return Ok(Some(desktop));
+    }
+    for term in terms {
+        match term {
+            ProxyTerm::SelfEgress => return Ok(None),
+            ProxyTerm::Device(device_id) => {
+                if let Some(desktop) = desktops
+                    .iter()
+                    .find(|d| d.active && &d.device_id == device_id)
+                {
+                    return Ok(Some(desktop));
+                }
+            }
+            ProxyTerm::AnyConnectedDesktop => {
+                if let Some(desktop) = desktops.iter().find(|d| d.active) {
+                    return Ok(Some(desktop));
+                }
+            }
         }
     }
-    let Some((_, path)) = newest else {
-        return Err(format!(
-            "no desktop is connected: no device record in {}",
-            describe_dir()
-        ));
+    Err(format!(
+        "no desktop is connected that satisfies any of these rules: {}",
+        describe_terms(terms)
+    ))
+}
+
+/// The desktop gateway this invocation is rewritten onto, or `None` when
+/// it goes out from this machine like any unproxied request. The devices
+/// directory, and the chosen desktop's record, are read only when the
+/// rules can lead to a desktop at all: the common case is the default
+/// `self`, where there is nothing to look up.
+fn plan_desktop_proxy(
+    argv: &[String],
+    rules: Option<&DesktopProxyRules>,
+) -> Result<Option<DesktopGateway>, String> {
+    let service_name = header_value(argv, MATCHED_SERVICE_HEADER_NAME);
+    let requested_device = header_value(argv, DESKTOP_DEVICE_HEADER_NAME);
+    // Latchkey names the service only for a request it injected
+    // credentials into. Anything else, and anything the config says
+    // nothing about, leaves from here.
+    let terms = match (rules, service_name) {
+        (Some(rules), Some(service_name)) => rules.terms_for(service_name),
+        _ => DEFAULT_PROXY_TERMS.as_slice(),
     };
-    Ok(path)
+    if requested_device.is_none() && matches!(terms.first(), Some(ProxyTerm::SelfEgress)) {
+        return Ok(None);
+    }
+    let desktops = list_desktops(&desktop_devices_dir(), SystemTime::now());
+    let chosen =
+        choose_desktop(terms, &desktops, requested_device).map_err(|err| match service_name {
+            Some(service_name) => {
+                format!("latchkey matched this request to service {service_name:?}: {err}")
+            }
+            None => err,
+        })?;
+    match chosen {
+        Some(desktop) => DesktopGateway::from_record(&desktop.path).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// Rewrite a matched invocation so it goes to the desktop gateway's
@@ -548,14 +815,14 @@ fn main() {
         .ok()
         .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
 
-    let desktop_proxy = DesktopProxyRules::from_env().unwrap_or_else(|message| die(message));
-    let route = choose_route(&argv, desktop_proxy.as_ref());
+    let rules = DesktopProxyRules::from_env().unwrap_or_else(|message| die(message));
+    let gateway = plan_desktop_proxy(&argv, rules.as_ref()).unwrap_or_else(|message| die(message));
+    let route = choose_route(&argv, gateway);
     // Read above, and of no use to anyone after us: not to the desktop
-    // gateway, which would forward it, nor to the third party.
-    argv = without_headers(&argv, &[MATCHED_SERVICE_HEADER_NAME]);
+    // gateway, which would forward them, nor to the third party.
+    argv = without_headers(&argv, ROUTER_ONLY_HEADERS);
     let target = match route {
-        Route::DesktopProxy => {
-            let gateway = DesktopGateway::from_env().unwrap_or_else(|message| die(message));
+        Route::DesktopProxy(gateway) => {
             argv =
                 rewrite_for_desktop_proxy(&argv, &gateway).unwrap_or_else(|message| die(message));
             resolve_real_curl(self_exe.as_deref())
@@ -694,9 +961,30 @@ mod tests {
         }
     }
 
-    fn rules(service_names: &[&str]) -> DesktopProxyRules {
+    /// A service's rules, written the way the config writes them.
+    fn terms(written: &[&str]) -> Vec<ProxyTerm> {
+        written
+            .iter()
+            .map(|term| ProxyTerm::parse(term).expect("a rule"))
+            .collect()
+    }
+
+    fn rules(services: &[(&str, &[&str])]) -> DesktopProxyRules {
         DesktopProxyRules {
-            service_names: service_names.iter().map(|n| n.to_string()).collect(),
+            services: services
+                .iter()
+                .map(|(service_name, written)| (service_name.to_string(), terms(written)))
+                .collect(),
+        }
+    }
+
+    /// A desktop with a record in the devices directory, connected or
+    /// not. The path is the one [`list_desktops`] would have given it.
+    fn desktop(device_id: &str, active: bool) -> Desktop {
+        Desktop {
+            device_id: device_id.to_string(),
+            path: PathBuf::from(format!("/devices/{device_id}.json")),
+            active,
         }
     }
 
@@ -724,18 +1012,48 @@ mod tests {
         ])
     }
 
-    /// Only a key with a truthy value is a rule; truthiness is
-    /// JavaScript's, since the file is written by JavaScript.
+    /// Each service's value is its rules, in the order they are tried. A
+    /// bare string is the one-rule list it reads as.
     #[test]
-    fn config_keeps_the_keys_with_truthy_values() {
+    fn config_reads_one_list_of_rules_per_service() {
         let parsed = DesktopProxyRules::parse(
             r#"{
-                "slack": true,
-                "github": 1,
-                "gitlab": "yes",
-                "on-a": [],
-                "on-b": {},
-                "on-c": 0.5,
+                "slack": ["self"],
+                "github": ["desktop-1", "desktop-2"],
+                "gitlab": ["desktop-1", "desktop-2", "self"],
+                "google-docs": "desktop-1",
+                "linear": "self",
+                "notion": []
+            }"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed,
+            rules(&[
+                ("slack", &["self"]),
+                ("github", &["desktop-1", "desktop-2"]),
+                ("gitlab", &["desktop-1", "desktop-2", "self"]),
+                ("google-docs", &["desktop-1"]),
+                ("linear", &["self"]),
+                ("notion", &[]),
+            ])
+        );
+    }
+
+    /// The config as it was before the rules were a list: one JavaScript
+    /// value per service, saying only whether it was proxied. Truthiness
+    /// is JavaScript's, since the file is written by JavaScript, and a
+    /// truthy value keeps doing what it did — whichever desktop is
+    /// connected — which no rule can ask for any more.
+    #[test]
+    fn config_reads_the_old_boolean_form() {
+        let parsed = DesktopProxyRules::parse(
+            r#"{
+                "on-true": true,
+                "on-one": 1,
+                "on-float": 0.5,
+                "on-array": [],
+                "on-object": {},
                 "off-false": false,
                 "off-zero": 0,
                 "off-float-zero": 0.0,
@@ -746,7 +1064,26 @@ mod tests {
         .expect("parses");
         assert_eq!(
             parsed,
-            rules(&["github", "gitlab", "on-a", "on-b", "on-c", "slack"])
+            DesktopProxyRules {
+                services: [
+                    ("on-true", vec![ProxyTerm::AnyConnectedDesktop]),
+                    ("on-one", vec![ProxyTerm::AnyConnectedDesktop]),
+                    ("on-float", vec![ProxyTerm::AnyConnectedDesktop]),
+                    // An empty list is no rule at all, which is what an
+                    // empty JSON array has to mean now; it was truthy
+                    // before.
+                    ("on-array", vec![]),
+                    ("on-object", vec![ProxyTerm::AnyConnectedDesktop]),
+                    ("off-false", terms(&["self"])),
+                    ("off-zero", terms(&["self"])),
+                    ("off-float-zero", terms(&["self"])),
+                    ("off-empty", terms(&["self"])),
+                    ("off-null", terms(&["self"])),
+                ]
+                .into_iter()
+                .map(|(service_name, terms)| (service_name.to_string(), terms))
+                .collect(),
+            }
         );
     }
 
@@ -761,15 +1098,34 @@ mod tests {
         assert_eq!(DesktopProxyRules::parse("{}").unwrap(), rules(&[]));
     }
 
+    /// A rule list holds strings, and a string that names nothing is a
+    /// typo rather than a device id: either is loud, since a config that
+    /// does not mean what it says would route a request to the wrong
+    /// source address.
+    #[test]
+    fn config_rejects_a_rule_that_is_not_a_device_id_or_a_rule_name() {
+        for text in [
+            r#"{"slack": [1]}"#,
+            r#"{"slack": [true]}"#,
+            r#"{"slack": [null]}"#,
+            r#"{"slack": [["desktop-1"]]}"#,
+            r#"{"slack": ["self", ""]}"#,
+        ] {
+            let err = DesktopProxyRules::parse(text).expect_err(text);
+            assert!(err.contains("slack"), "{text}: {err}");
+        }
+    }
+
     /// A service name is matched whole and as written: latchkey's names
     /// are case-sensitive identifiers, and one may be a prefix of another
-    /// (`fastmail`, `fastmail-dav`).
+    /// (`fastmail`, `fastmail-dav`). Anything the config does not name
+    /// goes out from this machine, which is also what an empty config and
+    /// no config at all mean.
     #[test]
-    fn a_service_name_matches_exactly() {
-        let rules = rules(&["fastmail", "google-docs"]);
-        for service_name in ["fastmail", "google-docs"] {
-            assert!(rules.matches(service_name), "{service_name:?} should match");
-        }
+    fn a_service_the_config_does_not_name_goes_out_from_here() {
+        let rules = rules(&[("fastmail", &["desktop-1"]), ("google-docs", &["self"])]);
+        assert_eq!(rules.terms_for("fastmail"), terms(&["desktop-1"]));
+        assert_eq!(rules.terms_for("google-docs"), terms(&["self"]));
         for service_name in [
             "fastmail-dav",
             "fast",
@@ -778,11 +1134,16 @@ mod tests {
             "",
             " fastmail",
         ] {
-            assert!(
-                !rules.matches(service_name),
-                "{service_name:?} should not match"
+            assert_eq!(
+                rules.terms_for(service_name),
+                DEFAULT_PROXY_TERMS,
+                "{service_name:?}"
             );
         }
+        assert_eq!(
+            DesktopProxyRules::default().terms_for("slack"),
+            DEFAULT_PROXY_TERMS
+        );
     }
 
     #[test]
@@ -847,69 +1208,201 @@ mod tests {
         );
     }
 
-    /// A matched request goes to the desktop proxy even when it also
-    /// carries the impersonation marker, so the marker reaches the
-    /// desktop gateway's own curl intact.
+    /// A request the rules sent to a desktop goes there even when it also
+    /// carries the impersonation marker, so the marker reaches the desktop
+    /// gateway's own curl intact.
     #[test]
-    fn desktop_proxy_is_decided_before_impersonation() {
-        let slack = rules(&["slack"]);
+    fn a_desktop_is_routed_to_before_impersonation_is_considered() {
+        let gateway = gateway_with_secrets();
         assert_eq!(
-            choose_route(&gateway_invocation("slack"), Some(&slack)),
-            Route::DesktopProxy
+            choose_route(&gateway_invocation("slack"), Some(gateway_with_secrets())),
+            Route::DesktopProxy(gateway)
         );
         assert_eq!(
             choose_route(&gateway_invocation("slack"), None),
             Route::Impersonate
         );
         assert_eq!(
-            choose_route(&gateway_invocation("slack"), Some(&rules(&["claude-ai"]))),
-            Route::Impersonate
-        );
-        assert_eq!(
-            choose_route(
-                &argv(&[
-                    "-H",
-                    "X-Latchkey-Matched-Service: slack",
-                    "https://slack.com/api/users.list"
-                ]),
-                Some(&slack)
-            ),
-            Route::DesktopProxy
+            choose_route(&argv(&["https://slack.com/api/users.list"]), None),
+            Route::SystemCurl
         );
     }
 
-    /// The decision is latchkey's statement of the service and nothing
-    /// else: a URL that happens to belong to a routed service is not
-    /// proxied when latchkey did not say so, which is the case for a
-    /// request it injected nothing into.
+    /// The rules are walked in order, and the first of them a connected
+    /// desktop satisfies is the one that carries the request. A desktop
+    /// that is not connected is passed over rather than tried.
     #[test]
-    fn only_the_matched_service_header_decides() {
-        let slack = rules(&["slack"]);
-        for tokens in [
-            argv(&["--version"]),
-            argv(&[]),
-            argv(&["-H", "Accept: */*", "https://slack.com/api/users.list"]),
-            argv(&[
-                "-H",
-                "X-Latchkey-Matched-Service: github",
-                "https://slack.com/api/users.list",
-            ]),
-            argv(&[
-                "-H",
-                "X-Latchkey-Matched-Service;",
-                "https://slack.com/api/users.list",
-            ]),
-            argv(&[
-                "-o",
-                "X-Latchkey-Matched-Service: slack",
-                "https://slack.com/api/users.list",
-            ]),
+    fn the_first_rule_a_connected_desktop_satisfies_wins() {
+        let desktops = [
+            desktop("laptop", true),
+            desktop("mac-at-the-office", false),
+            desktop("old-tower", true),
+        ];
+        for (written, chosen) in [
+            (&["mac-at-the-office", "old-tower"][..], Some("old-tower")),
+            (&["old-tower", "laptop"][..], Some("old-tower")),
+            (&["mac-at-the-office", "laptop"][..], Some("laptop")),
+            // `self` is satisfied by nothing being connected, so no rule
+            // after it is ever reached.
+            (&["mac-at-the-office", "self", "laptop"][..], None),
+            (&["self", "laptop"][..], None),
+            (&["self"][..], None),
         ] {
             assert_eq!(
-                choose_route(&tokens, Some(&slack)),
-                Route::SystemCurl,
-                "{tokens:?}"
+                choose_desktop(&terms(written), &desktops, None)
+                    .expect("satisfiable")
+                    .map(|desktop| desktop.device_id.as_str()),
+                chosen,
+                "{written:?}"
             );
+        }
+    }
+
+    /// The old config's truthy value still goes to the desktop the user
+    /// is at: the one that sent a keepalive most recently, which is the
+    /// order [`list_desktops`] returns them in.
+    #[test]
+    fn the_old_truthy_value_takes_the_most_recently_seen_connected_desktop() {
+        let desktops = [
+            desktop("just-woke-up", false),
+            desktop("here-now", true),
+            desktop("idle-but-connected", true),
+        ];
+        assert_eq!(
+            choose_desktop(&[ProxyTerm::AnyConnectedDesktop], &desktops, None)
+                .expect("satisfiable")
+                .map(|desktop| desktop.device_id.as_str()),
+            Some("here-now")
+        );
+        // And fails the same way when none of them is connected.
+        let err = choose_desktop(&[ProxyTerm::AnyConnectedDesktop], &[], None)
+            .expect_err("nowhere to send it");
+        assert!(err.contains("no desktop is connected"), "{err}");
+    }
+
+    /// Rules that call for a desktop and find none are an error, not a
+    /// request let out from this machine instead: the operator asked for
+    /// a different source address on purpose.
+    #[test]
+    fn rules_no_desktop_can_satisfy_are_an_error() {
+        // One desktop, asleep, and the same with no desktop at all.
+        for desktops in [&[desktop("mac-at-the-office", false)][..], &[][..]] {
+            for written in [
+                &["mac-at-the-office"][..],
+                &["laptop", "mac-at-the-office"][..],
+                // Written as an empty list: nowhere to go, deliberately.
+                &[][..],
+            ] {
+                let err = choose_desktop(&terms(written), desktops, None)
+                    .expect_err("nowhere to send it");
+                assert!(
+                    err.contains("no desktop is connected"),
+                    "{written:?}: {err}"
+                );
+            }
+            // The same rules with `self` at the end have somewhere to go.
+            assert_eq!(
+                choose_desktop(
+                    &terms(&["laptop", "mac-at-the-office", "self"]),
+                    desktops,
+                    None
+                )
+                .expect("satisfiable"),
+                None
+            );
+        }
+    }
+
+    /// The caller may name the desktop itself, and gets it whether or not
+    /// the rules would have chosen it, and whether or not it is the one
+    /// seen most recently.
+    #[test]
+    fn the_device_header_names_the_desktop_within_what_the_rules_admit() {
+        let desktops = [
+            desktop("laptop", true),
+            desktop("mac-at-the-office", true),
+            desktop("gone-to-sleep", false),
+        ];
+        for (written, requested) in [
+            (&["laptop", "mac-at-the-office"][..], "mac-at-the-office"),
+            (&["mac-at-the-office", "self"][..], "mac-at-the-office"),
+            // Last in the rules, and the rule before it would have
+            // answered: admissibility is not the walk.
+            (
+                &["laptop", "self", "mac-at-the-office"][..],
+                "mac-at-the-office",
+            ),
+        ] {
+            assert_eq!(
+                choose_desktop(&terms(written), &desktops, Some(requested))
+                    .expect("admissible")
+                    .map(|desktop| desktop.device_id.as_str()),
+                Some(requested),
+                "{written:?}"
+            );
+        }
+        // A desktop that has not been heard from recently is still the
+        // one asked for: the request fails at its port rather than here.
+        assert_eq!(
+            choose_desktop(
+                &terms(&["gone-to-sleep", "laptop"]),
+                &desktops,
+                Some("gone-to-sleep")
+            )
+            .expect("admissible")
+            .map(|desktop| desktop.device_id.as_str()),
+            Some("gone-to-sleep")
+        );
+        // The old config's truthy value admits whichever desktop is
+        // named, since it would have used whichever was connected.
+        assert_eq!(
+            choose_desktop(
+                &[ProxyTerm::AnyConnectedDesktop],
+                &desktops,
+                Some("mac-at-the-office")
+            )
+            .expect("admissible")
+            .map(|desktop| desktop.device_id.as_str()),
+            Some("mac-at-the-office")
+        );
+    }
+
+    /// A desktop the rules do not admit is refused, and so is a value
+    /// that is not the id of a device with a record here — a wildcard, a
+    /// list, a rule name, an empty header.
+    #[test]
+    fn the_device_header_is_refused_unless_the_rules_admit_a_known_device() {
+        let desktops = [desktop("laptop", true), desktop("mac-at-the-office", true)];
+        for (written, requested) in [
+            (&["self"][..], "laptop"),
+            (&[][..], "laptop"),
+            (&["laptop"][..], "mac-at-the-office"),
+            (&["laptop", "self"][..], "mac-at-the-office"),
+        ] {
+            let err = choose_desktop(&terms(written), &desktops, Some(requested))
+                .expect_err("not admitted");
+            assert!(err.contains(DESKTOP_DEVICE_HEADER_NAME), "{err}");
+            assert!(err.contains(requested), "{written:?}: {err}");
+        }
+        // The old config's truthy value admits any device, so these get
+        // as far as the lookup and are refused for not naming a device
+        // with a record here.
+        for requested in [
+            "*",
+            "",
+            "self",
+            "laptop,mac-at-the-office",
+            "LAPTOP",
+            "tablet",
+        ] {
+            let err = choose_desktop(
+                &[ProxyTerm::AnyConnectedDesktop],
+                &desktops,
+                Some(requested),
+            )
+            .expect_err("unknown");
+            assert!(err.contains(DESKTOP_DEVICE_HEADER_NAME), "{err}");
+            assert!(err.contains("known device"), "{requested:?}: {err}");
         }
     }
 
@@ -1228,8 +1721,18 @@ mod tests {
             path
         }
 
-        fn newest(&self) -> Result<PathBuf, String> {
-            newest_device_record(&self.dir)
+        /// The desktops the router sees here, most recently touched
+        /// first.
+        fn list(&self) -> Vec<Desktop> {
+            list_desktops(&self.dir, self.now)
+        }
+
+        /// Their device ids, in that order.
+        fn device_ids(&self) -> Vec<String> {
+            self.list()
+                .into_iter()
+                .map(|desktop| desktop.device_id)
+                .collect()
         }
     }
 
@@ -1241,61 +1744,100 @@ mod tests {
 
     const SECS: fn(u64) -> Duration = Duration::from_secs;
 
-    /// The desktop touching its record most recently is the one the user
-    /// is at, whatever its name and whenever it first connected.
+    /// The desktops come back most recently touched first: the one
+    /// touching its record last is the one the user is at, whatever its
+    /// name and whenever it first connected.
     #[test]
-    fn the_most_recently_touched_record_wins() {
+    fn the_most_recently_touched_record_comes_first() {
         let devices = DevicesDir::new("newest");
         devices.touch("aaa-first-connected.json", SECS(50));
-        let current = devices.touch("mmm-current.json", SECS(5));
+        devices.touch("mmm-current.json", SECS(5));
         devices.touch("zzz-idle.json", SECS(120));
-        assert_eq!(devices.newest().unwrap(), current);
+        assert_eq!(
+            devices.device_ids(),
+            ["mmm-current", "aaa-first-connected", "zzz-idle"]
+        );
+    }
+
+    /// The record's name is the device id a rule names it by, and its
+    /// path is where its gateway is read from.
+    #[test]
+    fn a_record_is_a_desktop_named_after_its_file() {
+        let devices = DevicesDir::new("device-id");
+        let path = devices.touch("mac-at-the-office.json", SECS(5));
+        assert_eq!(
+            devices.list(),
+            [Desktop {
+                device_id: "mac-at-the-office".to_string(),
+                path,
+                active: true,
+            }]
+        );
     }
 
     /// Only `<device_id>.json` files are records: a lock file, a backup
-    /// or a subdirectory is not a desktop, however fresh.
+    /// or a subdirectory is not a desktop, however fresh. Neither is a
+    /// record named after the one rule name, which no rule could name.
     #[test]
     fn only_json_files_are_device_records() {
         let devices = DevicesDir::new("only-json");
-        let record = devices.touch("mac-1.json", SECS(30));
+        devices.touch("mac-1.json", SECS(30));
         devices.touch("mac-2.json.tmp", SECS(0));
         devices.touch("mac-2.json~", SECS(0));
         devices.touch("notes.txt", SECS(0));
+        devices.touch("self.json", SECS(0));
         std::fs::create_dir(devices.dir.join("nested.json")).unwrap();
-        assert_eq!(devices.newest().unwrap(), record);
+        assert_eq!(devices.device_ids(), ["mac-1"]);
     }
 
-    /// Two records touched in the same instant resolve the same way every
+    /// Two records touched in the same instant order the same way every
     /// time, rather than by directory order.
     #[test]
     fn a_tie_on_the_modification_time_is_broken_by_name() {
         let devices = DevicesDir::new("tie");
         devices.touch("a.json", SECS(10));
-        let b = devices.touch("b.json", SECS(10));
-        assert_eq!(devices.newest().unwrap(), b);
+        devices.touch("b.json", SECS(10));
+        assert_eq!(devices.device_ids(), ["b", "a"]);
     }
 
-    /// How long ago the newest record was touched is not our concern: a
-    /// desktop that left its record behind is still the best guess, and
-    /// the request fails at its port rather than here.
+    /// A desktop is connected as long as its keepalives keep arriving. One
+    /// that stopped is still listed — the caller may name it outright —
+    /// but no rule is satisfied by it.
     #[test]
-    fn a_stale_record_is_still_chosen() {
-        let devices = DevicesDir::new("stale");
-        let stale = devices.touch("stale.json", SECS(30 * 24 * 3600));
-        assert_eq!(devices.newest().unwrap(), stale);
+    fn a_record_not_touched_recently_is_not_connected() {
+        let devices = DevicesDir::new("active");
+        devices.touch("here.json", SECS(0));
+        devices.touch("keepalive-missed.json", DESKTOP_ACTIVE_WINDOW - SECS(1));
+        devices.touch("gone.json", DESKTOP_ACTIVE_WINDOW + SECS(1));
+        devices.touch("long-gone.json", SECS(30 * 24 * 3600));
+        let active: Vec<(String, bool)> = devices
+            .list()
+            .into_iter()
+            .map(|desktop| (desktop.device_id, desktop.active))
+            .collect();
+        assert_eq!(
+            active,
+            [
+                ("here".to_string(), true),
+                ("keepalive-missed".to_string(), true),
+                ("gone".to_string(), false),
+                ("long-gone".to_string(), false),
+            ]
+        );
     }
 
-    /// No records, or no directory at all, is "no desktop is connected".
+    /// No records, and no directory at all, are both "no desktop", which
+    /// the rules — another desktop, or `self` — may well have an answer
+    /// for. It is [`choose_desktop`] that decides whether that is an
+    /// error.
     #[test]
-    fn no_record_means_no_connected_desktop() {
+    fn no_record_means_no_desktop() {
         let devices = DevicesDir::new("empty");
-        let err = devices.newest().expect_err("empty");
-        assert!(err.contains("no desktop is connected"), "{err}");
-
-        let missing = devices.dir.join("does-not-exist");
-        let err = newest_device_record(&missing).expect_err("missing");
-        assert!(err.contains("no desktop is connected"), "{err}");
-        assert!(err.contains("does-not-exist"), "{err}");
+        assert_eq!(devices.list(), []);
+        assert_eq!(
+            list_desktops(&devices.dir.join("does-not-exist"), devices.now),
+            []
+        );
     }
 
     #[test]
