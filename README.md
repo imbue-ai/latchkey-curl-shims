@@ -95,8 +95,7 @@ An empty list, `[]`, is the opposite: nowhere to go, so those requests
 fail.
 
 A bare string is read as a one-rule list (`"github": "desktop-id-1"`). A
-rule that is not a string, is the empty string, or is `any-desktop` —
-which was a rule in an earlier draft of this format — fails every
+rule that is not a string, or is the empty string, fails every
 invocation with exit 2: a config that does not mean what it says would
 send requests from the wrong address.
 
@@ -104,12 +103,12 @@ send requests from the wrong address.
 value and could say only "proxied" or "not". A falsy one (`false`, `0`,
 `""`, `null`) is read as `["self"]`, and a truthy one keeps doing what it
 did: the request goes to whichever desktop is connected, the one seen
-most recently when several are. That is the behaviour no rule can ask
-for any more, kept only so a file written before this format is not
-broken by it; a config still using it should be rewritten to name
-devices. The one thing that did change for it is the three-minute window
-below — a desktop whose keepalives stopped is no longer chosen, where
-before the request went to its port and failed there.
+most recently when several are. No rule can ask for that, since it names
+no device; it is kept only so a file written before this format is not
+broken by it, and such a file should be rewritten to name devices. The
+one thing that did change for it is the three-minute window below — a
+desktop whose keepalives stopped is no longer chosen, where before the
+request went to its port and failed there.
 
 ### Naming the desktop in the request
 
@@ -145,8 +144,8 @@ invocation. A record older than that is a desktop that went away,
 perhaps without cleaning up, and no rule is satisfied by it — which is
 what lets the rule after it, another desktop or `self`, take the
 request. The record's name without `.json` is the device id rules name it
-by; only `.json` files count, and `self.json` and `any-desktop.json` are
-ignored, since no rule could name them. Two records touched in the same
+by; only `.json` files count, and `self.json` is ignored, since no rule
+could name it. Two records touched in the same
 instant are ordered by name, so the choice is the same every time. A
 file whose metadata cannot be read is skipped with a warning on stderr
 rather than failing the request, and so is the whole directory when it

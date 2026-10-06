@@ -224,36 +224,23 @@ enum ProxyTerm {
     /// One desktop, named by the device id its record is called after.
     Device(String),
     /// Whichever desktop is connected; the one seen most recently when
-    /// several are. **Not a rule that can be written**: it is only what
-    /// the old config's truthy value is read as, since that value named
-    /// no device and this is what it used to do. A desktop reached this
-    /// way is whichever one the user happens to be at, which is why the
-    /// new rules name devices instead — a permission is granted to a
-    /// device, so the device has to be the one the config chose.
-    LegacyAnyDesktop,
+    /// several are. **No rule means this**: it is only what the old
+    /// config's truthy value is read as, since that value named no device
+    /// and this is what it did. A desktop reached this way is whichever
+    /// one the user happens to be at, which is why a rule names a device
+    /// instead — a permission is granted to one device, so the device has
+    /// to be the one the config chose.
+    AnyConnectedDesktop,
 }
 
-/// How [`ProxyTerm::SelfEgress`] is written in the config.
+/// How [`ProxyTerm::SelfEgress`] is written in the config. A device
+/// record under this name is ignored, since no rule could name it.
 const SELF_TERM: &str = "self";
-
-/// The rule that used to mean [`ProxyTerm::LegacyAnyDesktop`]. It is no
-/// longer one: a permission belongs to a device, so a rule has to name
-/// the device it is about. The name stays reserved rather than becoming
-/// an ordinary device id, so a config that still writes it is refused
-/// instead of being read as a device that will never be found.
-const RETIRED_ANY_DESKTOP_TERM: &str = "any-desktop";
-
-/// Names a device record cannot use, because no rule could then name it:
-/// the one rule name, and the retired one.
-const RESERVED_DEVICE_IDS: &[&str] = &[SELF_TERM, RETIRED_ANY_DESKTOP_TERM];
 
 impl ProxyTerm {
     fn parse(text: &str) -> Result<Self, String> {
         match text {
             SELF_TERM => Ok(Self::SelfEgress),
-            RETIRED_ANY_DESKTOP_TERM => Err(format!(
-                "{RETIRED_ANY_DESKTOP_TERM:?} is no longer a rule: name the device ids to try,                  since a permission is granted to one device"
-            )),
             "" => Err(format!(
                 "a rule is {SELF_TERM:?} or a device id, not an empty string"
             )),
@@ -273,7 +260,7 @@ impl ProxyTerm {
             // The old config's truthy value would have sent the request
             // to whichever desktop was connected, so naming one of them
             // asks for no more than it already allowed.
-            Self::LegacyAnyDesktop => true,
+            Self::AnyConnectedDesktop => true,
         }
     }
 }
@@ -283,7 +270,7 @@ impl std::fmt::Display for ProxyTerm {
         match self {
             Self::SelfEgress => f.write_str(SELF_TERM),
             Self::Device(device_id) => f.write_str(device_id),
-            Self::LegacyAnyDesktop => f.write_str("<any connected desktop>"),
+            Self::AnyConnectedDesktop => f.write_str("<any connected desktop>"),
         }
     }
 }
@@ -353,9 +340,9 @@ impl DesktopProxyRules {
 ///
 /// Anything else is the old config, which held one JavaScript value per
 /// service and could only say "proxied" or "not": a truthy one becomes
-/// [`ProxyTerm::LegacyAnyDesktop`], which is what it used to do and
-/// cannot be asked for in the new form, and a falsy one — `false`, `0`,
-/// `""`, `null` — becomes `[self]`.
+/// [`ProxyTerm::AnyConnectedDesktop`], which is what it did and which no
+/// rule can ask for, and a falsy one — `false`, `0`, `""`, `null` —
+/// becomes `[self]`.
 fn parse_terms(value: &Value) -> Result<Vec<ProxyTerm>, String> {
     match value {
         Value::Array(items) => items
@@ -366,7 +353,7 @@ fn parse_terms(value: &Value) -> Result<Vec<ProxyTerm>, String> {
             })
             .collect(),
         Value::String(text) if !text.is_empty() => Ok(vec![ProxyTerm::parse(text)?]),
-        legacy if is_truthy(legacy) => Ok(vec![ProxyTerm::LegacyAnyDesktop]),
+        legacy if is_truthy(legacy) => Ok(vec![ProxyTerm::AnyConnectedDesktop]),
         _ => Ok(vec![ProxyTerm::SelfEgress]),
     }
 }
@@ -576,9 +563,9 @@ fn list_desktops(devices_dir: &Path, now: SystemTime) -> Vec<Desktop> {
             ));
             continue;
         };
-        if RESERVED_DEVICE_IDS.contains(&device_id) {
+        if device_id == SELF_TERM {
             warn(format!(
-                "skipping device record {}: {device_id:?} is a reserved name no rule can name",
+                "skipping device record {}: {device_id:?} is the name of a rule, not a device id",
                 path.display()
             ));
             continue;
@@ -672,7 +659,7 @@ fn choose_desktop<'a>(
                     return Ok(Some(desktop));
                 }
             }
-            ProxyTerm::LegacyAnyDesktop => {
+            ProxyTerm::AnyConnectedDesktop => {
                 if let Some(desktop) = desktops.iter().find(|d| d.active) {
                     return Ok(Some(desktop));
                 }
@@ -1079,14 +1066,14 @@ mod tests {
             parsed,
             DesktopProxyRules {
                 services: [
-                    ("on-true", vec![ProxyTerm::LegacyAnyDesktop]),
-                    ("on-one", vec![ProxyTerm::LegacyAnyDesktop]),
-                    ("on-float", vec![ProxyTerm::LegacyAnyDesktop]),
+                    ("on-true", vec![ProxyTerm::AnyConnectedDesktop]),
+                    ("on-one", vec![ProxyTerm::AnyConnectedDesktop]),
+                    ("on-float", vec![ProxyTerm::AnyConnectedDesktop]),
                     // An empty list is no rule at all, which is what an
                     // empty JSON array has to mean now; it was truthy
                     // before.
                     ("on-array", vec![]),
-                    ("on-object", vec![ProxyTerm::LegacyAnyDesktop]),
+                    ("on-object", vec![ProxyTerm::AnyConnectedDesktop]),
                     ("off-false", terms(&["self"])),
                     ("off-zero", terms(&["self"])),
                     ("off-float-zero", terms(&["self"])),
@@ -1125,23 +1112,6 @@ mod tests {
             r#"{"slack": ["self", ""]}"#,
         ] {
             let err = DesktopProxyRules::parse(text).expect_err(text);
-            assert!(err.contains("slack"), "{text}: {err}");
-        }
-    }
-
-    /// `any-desktop` was a rule and is not one any more: a config still
-    /// writing it is refused rather than read as a device id that will
-    /// never be found. Only the old config's truthy value still reaches
-    /// that behaviour.
-    #[test]
-    fn config_rejects_the_retired_any_desktop_rule() {
-        for text in [
-            r#"{"slack": ["any-desktop"]}"#,
-            r#"{"slack": ["desktop-1", "any-desktop"]}"#,
-            r#"{"slack": "any-desktop"}"#,
-        ] {
-            let err = DesktopProxyRules::parse(text).expect_err(text);
-            assert!(err.contains("no longer a rule"), "{text}: {err}");
             assert!(err.contains("slack"), "{text}: {err}");
         }
     }
@@ -1299,13 +1269,13 @@ mod tests {
             desktop("idle-but-connected", true),
         ];
         assert_eq!(
-            choose_desktop(&[ProxyTerm::LegacyAnyDesktop], &desktops, None)
+            choose_desktop(&[ProxyTerm::AnyConnectedDesktop], &desktops, None)
                 .expect("satisfiable")
                 .map(|desktop| desktop.device_id.as_str()),
             Some("here-now")
         );
         // And fails the same way when none of them is connected.
-        let err = choose_desktop(&[ProxyTerm::LegacyAnyDesktop], &[], None)
+        let err = choose_desktop(&[ProxyTerm::AnyConnectedDesktop], &[], None)
             .expect_err("nowhere to send it");
         assert!(err.contains("no desktop is connected"), "{err}");
     }
@@ -1387,7 +1357,7 @@ mod tests {
         // named, since it would have used whichever was connected.
         assert_eq!(
             choose_desktop(
-                &[ProxyTerm::LegacyAnyDesktop],
+                &[ProxyTerm::AnyConnectedDesktop],
                 &desktops,
                 Some("mac-at-the-office")
             )
@@ -1421,13 +1391,16 @@ mod tests {
             "*",
             "",
             "self",
-            "any-desktop",
             "laptop,mac-at-the-office",
             "LAPTOP",
             "tablet",
         ] {
-            let err = choose_desktop(&[ProxyTerm::LegacyAnyDesktop], &desktops, Some(requested))
-                .expect_err("unknown");
+            let err = choose_desktop(
+                &[ProxyTerm::AnyConnectedDesktop],
+                &desktops,
+                Some(requested),
+            )
+            .expect_err("unknown");
             assert!(err.contains(DESKTOP_DEVICE_HEADER_NAME), "{err}");
             assert!(err.contains("known device"), "{requested:?}: {err}");
         }
@@ -1804,7 +1777,7 @@ mod tests {
 
     /// Only `<device_id>.json` files are records: a lock file, a backup
     /// or a subdirectory is not a desktop, however fresh. Neither is a
-    /// record under a reserved name, which no rule could name.
+    /// record named after the one rule name, which no rule could name.
     #[test]
     fn only_json_files_are_device_records() {
         let devices = DevicesDir::new("only-json");
@@ -1813,7 +1786,6 @@ mod tests {
         devices.touch("mac-2.json~", SECS(0));
         devices.touch("notes.txt", SECS(0));
         devices.touch("self.json", SECS(0));
-        devices.touch("any-desktop.json", SECS(0));
         std::fs::create_dir(devices.dir.join("nested.json")).unwrap();
         assert_eq!(devices.device_ids(), ["mac-1"]);
     }

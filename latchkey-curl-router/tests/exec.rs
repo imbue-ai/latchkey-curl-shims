@@ -630,12 +630,6 @@ fn a_device_header_the_rules_do_not_allow_is_refused() {
             needle: "is not the id of a known device",
         },
         Case {
-            name: "the retired rule name",
-            config: Some(r#"{"slack": true}"#),
-            device: "any-desktop",
-            needle: "is not the id of a known device",
-        },
-        Case {
             name: "a desktop with no record here",
             config: Some(r#"{"slack": true}"#),
             device: "mac-at-the-office",
