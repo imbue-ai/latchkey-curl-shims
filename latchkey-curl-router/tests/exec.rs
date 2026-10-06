@@ -2,17 +2,33 @@
 //! cannot reach: a marked invocation execs the `curl-impersonate`
 //! sibling with the impersonation flags in front and our headers
 //! stripped, an unmarked one execs the `curl` on PATH untouched, and one
-//! matching the desktop-proxy config execs that `curl` against the
-//! gateway of the most recently active desktop. Both targets are fake
-//! scripts that print their argv.
+//! whose desktop-proxy rules name a connected desktop execs that `curl`
+//! against that desktop's gateway. Both targets are fake scripts that
+//! print their argv.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 const ROUTER: &str = env!("CARGO_BIN_EXE_latchkey-curl-router");
+
+/// Held while a sandbox's executables are written, and while a child is
+/// spawned. Spawning shares every open descriptor with a forked copy of
+/// this process until it execs, a binary another process holds open for
+/// writing cannot be exec'd (`ETXTBSY`), and the tests run in parallel:
+/// without this, one test's copy of the router races another's spawn.
+static EXECUTABLES: Mutex<()> = Mutex::new(());
+
+/// A child of the router, run without a sandbox being written under it.
+fn output(command: &mut Command) -> Output {
+    let _executables = EXECUTABLES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    command.output().unwrap()
+}
 
 fn write_fake(dir: &Path, name: &str, banner: &str) {
     let path = dir.join(name);
@@ -34,6 +50,9 @@ struct Sandbox {
 
 impl Sandbox {
     fn new(name: &str) -> Self {
+        let _executables = EXECUTABLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "latchkey-curl-router-exec-{}-{name}",
             std::process::id()
@@ -107,7 +126,7 @@ impl Drop for Sandbox {
 }
 
 fn run(command: &mut Command) -> Vec<String> {
-    let output = command.output().unwrap();
+    let output = output(command);
     assert!(
         output.status.success(),
         "router failed: {}",
@@ -250,14 +269,14 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
         ])
     );
 
-    // A desktop whose record asks for no secrets gets none, and how long
-    // ago it was last heard from does not matter: once the laptop's record
-    // is gone, the office desktop is the newest, however old.
+    // A desktop whose record asks for no secrets gets none: once the
+    // laptop's record is gone, the office desktop is the one the old
+    // config's `true` — whichever desktop is connected — picks.
     fs::remove_file(sandbox.devices_dir().join("laptop-at-home.json")).unwrap();
     sandbox.write_device_record(
         "mac-at-the-office",
         r#"{"port": 40001, "gateway_password": null}"#,
-        Duration::from_secs(3 * 24 * 3600),
+        Duration::from_secs(30),
     );
     let got = run(sandbox
         .router_with_fake_system_curl()
@@ -317,16 +336,13 @@ fn desktop_proxy_config_that_cannot_be_used_is_an_error_not_a_direct_request() {
         (malformed, "expected a JSON object"),
         (missing, "cannot read"),
     ] {
-        let output = sandbox
-            .router_with_fake_system_curl()
-            .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
-            .args([
-                "-H",
-                "X-Latchkey-Matched-Service: slack",
-                "https://slack.com/api/users.list",
-            ])
-            .output()
-            .unwrap();
+        let mut command = sandbox.router_with_fake_system_curl();
+        command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config).args([
+            "-H",
+            "X-Latchkey-Matched-Service: slack",
+            "https://slack.com/api/users.list",
+        ]);
+        let output = output(&mut command);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(2), "{config:?}: {stderr}");
         assert!(stderr.contains(needle), "{config:?}: {stderr}");
@@ -403,15 +419,12 @@ fn desktop_that_cannot_be_reached_is_an_error_not_a_direct_request() {
         if let Some((name, value)) = case.env {
             command.env(name, value);
         }
-        let output = command
-            .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
-            .args([
-                "-H",
-                "X-Latchkey-Matched-Service: slack",
-                "https://slack.com/api/users.list",
-            ])
-            .output()
-            .unwrap();
+        command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config).args([
+            "-H",
+            "X-Latchkey-Matched-Service: slack",
+            "https://slack.com/api/users.list",
+        ]);
+        let output = output(&mut command);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let name = case.name;
         assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
@@ -421,5 +434,235 @@ fn desktop_that_cannot_be_reached_is_an_error_not_a_direct_request() {
             "{name}: nothing should have been exec'd"
         );
         let _ = fs::remove_dir_all(sandbox.devices_dir());
+    }
+}
+
+/// The rules are tried in order: the first desktop among them that is
+/// still sending keepalives carries the request, and `self` at the end
+/// lets it out from this machine when none of them is. A service the
+/// config says nothing about gets that implicit `[self]` without having
+/// to write it.
+#[test]
+fn rules_are_tried_in_order_and_self_lets_the_request_out_from_here() {
+    let sandbox = Sandbox::new("rule-order");
+    let config = sandbox.write_desktop_proxy_config(
+        "rules.json",
+        r#"{
+            "slack": ["mac-at-the-office", "laptop-at-home", "self"],
+            "github": ["mac-at-the-office"]
+        }"#,
+    );
+    // The office mac stopped sending keepalives a quarter of an hour ago,
+    // so its rule is passed over rather than tried.
+    sandbox.write_device_record(
+        "mac-at-the-office",
+        r#"{"port": 40001}"#,
+        Duration::from_secs(900),
+    );
+    sandbox.write_device_record(
+        "laptop-at-home",
+        r#"{"port": 40002, "gateway_password": "hunter2"}"#,
+        Duration::from_secs(20),
+    );
+    let slack = |sandbox: &Sandbox| {
+        let mut command = sandbox.router_with_fake_system_curl();
+        command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config);
+        command.args([
+            "-H",
+            "X-Latchkey-Matched-Service: slack",
+            "-sS",
+            "https://slack.com/api/users.list",
+        ]);
+        command
+    };
+    assert_eq!(
+        run(&mut slack(&sandbox)),
+        lines(&[
+            "system-curl",
+            "-H",
+            "X-Latchkey-Gateway-No-Credentials: 1",
+            "-H",
+            "X-Latchkey-Gateway-Password: hunter2",
+            "-sS",
+            "http://127.0.0.1:40002/gateway/https://slack.com/api/users.list",
+        ])
+    );
+
+    // With the laptop gone too, no rule but `self` is left: the request
+    // goes out from here, as an unproxied one always has.
+    fs::remove_file(sandbox.devices_dir().join("laptop-at-home.json")).unwrap();
+    assert_eq!(
+        run(&mut slack(&sandbox)),
+        lines(&["system-curl", "-sS", "https://slack.com/api/users.list"])
+    );
+
+    // A service whose only rule is a desktop that stopped sending
+    // keepalives has nowhere to send it.
+    let mut command = sandbox.router_with_fake_system_curl();
+    command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config).args([
+        "-H",
+        "X-Latchkey-Matched-Service: github",
+        "https://api.github.com/user",
+    ]);
+    let output = output(&mut command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("no desktop is connected"), "{stderr}");
+    assert!(output.stdout.is_empty(), "nothing should have been exec'd");
+
+    // A service the config does not name at all is `[self]`, however
+    // many desktops are connected.
+    sandbox.write_device_record(
+        "laptop-at-home",
+        r#"{"port": 40002}"#,
+        Duration::from_secs(5),
+    );
+    let got = run(sandbox
+        .router_with_fake_system_curl()
+        .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
+        .args([
+            "-H",
+            "X-Latchkey-Matched-Service: linear",
+            "https://api.linear.app/graphql",
+        ]));
+    assert_eq!(
+        got,
+        lines(&["system-curl", "https://api.linear.app/graphql"])
+    );
+}
+
+/// A caller may name the desktop itself, within what the service's rules
+/// admit. The header is ours: it reaches neither the desktop gateway nor
+/// the third party.
+#[test]
+fn the_device_header_picks_the_desktop_and_is_dropped() {
+    let sandbox = Sandbox::new("device-header");
+    let config = sandbox.write_desktop_proxy_config(
+        "rules.json",
+        r#"{"slack": ["laptop-at-home", "mac-at-the-office"]}"#,
+    );
+    sandbox.write_device_record(
+        "mac-at-the-office",
+        r#"{"port": 40001, "gateway_password": "office"}"#,
+        Duration::from_secs(60),
+    );
+    // The laptop is the one the rules would have chosen.
+    sandbox.write_device_record(
+        "laptop-at-home",
+        r#"{"port": 40002, "gateway_password": "hunter2"}"#,
+        Duration::from_secs(5),
+    );
+    let got = run(sandbox
+        .router_with_fake_system_curl()
+        .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
+        .args([
+            "-H",
+            "X-Latchkey-Matched-Service: slack",
+            "-H",
+            "X-Latchkey-Device: mac-at-the-office",
+            "-sS",
+            "https://slack.com/api/users.list",
+        ]));
+    assert_eq!(
+        got,
+        lines(&[
+            "system-curl",
+            "-H",
+            "X-Latchkey-Gateway-No-Credentials: 1",
+            "-H",
+            "X-Latchkey-Gateway-Password: office",
+            "-sS",
+            "http://127.0.0.1:40001/gateway/https://slack.com/api/users.list",
+        ])
+    );
+}
+
+/// The header picks among the desktops the rules allow; it does not add
+/// one. A device no rule admits, a value that is not the id of a device
+/// with a record here, and a request with no rules that allow a desktop
+/// at all are all refused rather than sent somewhere else.
+#[test]
+fn a_device_header_the_rules_do_not_allow_is_refused() {
+    struct Case {
+        name: &'static str,
+        config: Option<&'static str>,
+        device: &'static str,
+        needle: &'static str,
+    }
+    let sandbox = Sandbox::new("device-header-refused");
+    sandbox.write_device_record(
+        "laptop-at-home",
+        r#"{"port": 40002}"#,
+        Duration::from_secs(5),
+    );
+    let cases = [
+        Case {
+            name: "a desktop these rules never allow",
+            config: Some(r#"{"slack": ["mac-at-the-office", "self"]}"#),
+            device: "laptop-at-home",
+            needle: "is not a desktop these rules allow",
+        },
+        Case {
+            name: "a service that goes out from here",
+            config: Some(r#"{"slack": ["self"]}"#),
+            device: "laptop-at-home",
+            needle: "is not a desktop these rules allow",
+        },
+        Case {
+            name: "no config at all",
+            config: None,
+            device: "laptop-at-home",
+            needle: "is not a desktop these rules allow",
+        },
+        // The old config's truthy value admits any device, so these get
+        // as far as the lookup and are refused for naming no device with
+        // a record here.
+        Case {
+            name: "a wildcard",
+            config: Some(r#"{"slack": true}"#),
+            device: "*",
+            needle: "is not the id of a known device",
+        },
+        Case {
+            name: "a list of device ids",
+            config: Some(r#"{"slack": true}"#),
+            device: "laptop-at-home,mac-at-the-office",
+            needle: "is not the id of a known device",
+        },
+        Case {
+            name: "the retired rule name",
+            config: Some(r#"{"slack": true}"#),
+            device: "any-desktop",
+            needle: "is not the id of a known device",
+        },
+        Case {
+            name: "a desktop with no record here",
+            config: Some(r#"{"slack": true}"#),
+            device: "mac-at-the-office",
+            needle: "is not the id of a known device",
+        },
+    ];
+    for case in cases {
+        let mut command = sandbox.router_with_fake_system_curl();
+        if let Some(config) = case.config {
+            let path = sandbox.write_desktop_proxy_config("rules.json", config);
+            command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &path);
+        }
+        command.args([
+            "-H",
+            "X-Latchkey-Matched-Service: slack",
+            "-H",
+            &format!("X-Latchkey-Device: {}", case.device),
+            "https://slack.com/api/users.list",
+        ]);
+        let output = output(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let name = case.name;
+        assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
+        assert!(stderr.contains(case.needle), "{name}: {stderr}");
+        assert!(
+            output.stdout.is_empty(),
+            "{name}: nothing should have been exec'd"
+        );
     }
 }
