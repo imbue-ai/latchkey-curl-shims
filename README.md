@@ -7,8 +7,8 @@ expects:
 
 | binary | what it is |
 |---|---|
-| `latchkey-curl-router` | The `curl` that `LATCHKEY_CURL` points at. A small Rust program: an invocation whose service's desktop-proxy rules (below) name a connected desktop is rewritten onto the latchkey gateway on that computer. Otherwise, an invocation carrying the private `X-Imbue-Impersonate` header is rewritten (that header and any `User-Agent` dropped, `--compressed --noproxy '*' --impersonate <profile>` put in front) and handed to the impersonating curl next to it. Anything else goes to the system `curl` untouched. |
-| `curl-impersonate` | Upstream [curl-impersonate](https://github.com/lexiforest/curl-impersonate), unmodified: a curl with a patched BoringSSL and a built-in `--impersonate <browser>` flag that presents Chrome's TLS and HTTP/2 fingerprint. **On its own it does not impersonate**: without `--impersonate` it is a plain curl 8.x and gets the same `403` a stock curl does. The router is what adds the flag. |
+| `latchkey-curl-router` | The `curl` that `LATCHKEY_CURL` points at. A small Rust program: an invocation whose service's desktop-proxy rules (below) name a connected desktop is rewritten onto the latchkey gateway on that computer. Otherwise, an invocation carrying the private `X-Imbue-Impersonate` header is rewritten (that header and any `User-Agent` dropped, `--compressed --noproxy '*' --impersonate <profile>` put in front) and handed to the impersonating curl next to it. Anything else goes to that same curl untouched, which without the flag is a plain curl. **The router never runs the system `curl`.** |
+| `curl-impersonate` | Upstream [curl-impersonate](https://github.com/lexiforest/curl-impersonate), unmodified: a curl with a patched BoringSSL and a built-in `--impersonate <browser>` flag that presents Chrome's TLS and HTTP/2 fingerprint. **On its own it does not impersonate**: without `--impersonate` (and without a `CURL_IMPERSONATE` environment variable, which the router clears on its plain routes) it is a plain curl 8.x: BoringSSL's own TLS handshake, `User-Agent: curl/<version>-IMPERSONATE`, no browser headers, and the same `403` a stock curl gets (its HTTP/2 SETTINGS frame is Chrome's either way, since upstream changed curl's defaults). The router is what adds the flag. |
 
 Some of the hosts datalib mirrors, `claude.ai` and `chatgpt.com` today,
 reject any client whose TLS handshake does not look like a browser's. A
@@ -32,11 +32,30 @@ The `--impersonate` target is `DATALIB_IMPERSONATE_PROFILE`, default
 not know fails the request with exit 43 and a message naming a valid
 one.
 
+## Never the system curl
+
+Every request the router handles, impersonated or not, runs the
+`curl-impersonate` next to it. Which CA store a request is verified
+against is then the one described under "Where the impersonating curl
+comes from", on every machine, rather than whatever the host's own curl
+was built with: macOS's `/usr/bin/curl`, for one, verifies against the
+static bundle `/etc/ssl/cert.pem` rather than the system trust store.
+It also means the router works on a machine with no curl installed.
+
+The cost is what this build leaves out. Upstream's CMake enables
+neither GSS-API nor NTLM, so **there is no Kerberos, SPNEGO
+(`Negotiate`) or NTLM authentication**, to a server or to a proxy:
+`curl-impersonate -V` lists none of them on any of the six triples. A
+proxy that demands one of those fails every request the router sends
+through it, where the system curl may have authenticated. Basic and
+Digest authentication are not disabled. LDAP, SMB, SCP and SFTP are
+not built either; no latchkey request uses them.
+
 ## The desktop proxy
 
 A request can be made to leave from one of the user's own computers
-instead of from the machine the router runs on: the router hands it to
-the system curl, addressed to the `/gateway/<url>` endpoint of the
+instead of from the machine the router runs on: the router runs it as a
+plain curl, addressed to the `/gateway/<url>` endpoint of the
 latchkey gateway on that computer, with everything else in the
 invocation kept as it was. Which requests get this, and from which
 computers, is a JSON file of rules; which of those computers is
@@ -290,9 +309,12 @@ Two build choices worth knowing about:
   orders the runtime itself; we prefer the distro gcc and order it in
   the wrapper.
 
-Linux binaries read the host's CA store (`/etc/ssl/certs`), the way the
-system curl does; `SSL_CERT_FILE` overrides it. macOS binaries use the
-system trust store through Apple's Security framework.
+Linux binaries read the host's CA store
+(`/etc/ssl/certs/ca-certificates.crt` and `/etc/ssl/certs`, where Debian
+and Ubuntu keep it); `SSL_CERT_FILE` overrides it. macOS
+binaries verify through Apple's SecTrust, the system trust store, unless
+a CA file is named (`SSL_CERT_FILE`, `CURL_CA_BUNDLE` or `--cacert`), in
+which case that file is all they trust.
 
 **The musl legs are reproducible.** The `aarch64-unknown-linux-musl`
 binary of upstream v2.2.2, built on a GitHub arm64 runner, is

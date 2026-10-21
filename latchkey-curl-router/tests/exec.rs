@@ -1,10 +1,11 @@
 //! End-to-end check of the router's exec path, which the unit tests
-//! cannot reach: a marked invocation execs the `curl-impersonate`
-//! sibling with the impersonation flags in front and our headers
-//! stripped, an unmarked one execs the `curl` on PATH untouched, and one
-//! whose desktop-proxy rules name a connected desktop execs that `curl`
-//! against that desktop's gateway. Both targets are fake scripts that
-//! print their argv.
+//! cannot reach. Every invocation execs the `curl-impersonate` sibling: a
+//! marked one with the impersonation flags in front and our headers
+//! stripped, an unmarked one untouched, and one whose desktop-proxy rules
+//! name a connected desktop against that desktop's gateway. Only the
+//! marked one gets `--impersonate`. A fake `curl` comes first on PATH in
+//! every test, so a route that reached for the system curl would show.
+//! Both are fake scripts that print their argv.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -43,7 +44,8 @@ fn write_fake(dir: &Path, name: &str, banner: &str) {
 /// A fresh directory holding a copy of the router next to fake
 /// `curl-impersonate` and `curl` scripts. The router resolves
 /// its impersonator as a sibling of its own canonical path, so the copy
-/// is what makes the fake visible to it.
+/// is what makes the fake visible to it; the fake `curl` is never meant
+/// to run.
 struct Sandbox {
     dir: PathBuf,
 }
@@ -65,8 +67,14 @@ impl Sandbox {
         Self { dir }
     }
 
+    /// A router whose PATH starts with the sandbox, so the fake `curl` is
+    /// the system curl it would find if it looked for one.
     fn router(&self) -> Command {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![self.dir.clone()];
+        dirs.extend(std::env::split_paths(&path));
         let mut command = Command::new(self.dir.join("latchkey-curl-router"));
+        command.env("PATH", std::env::join_paths(dirs).unwrap());
         command.env_remove("DATALIB_IMPERSONATE_PROFILE");
         command.env_remove("LATCHKEY_DESKTOP_PROXY_CONFIG");
         command.env_remove("LATCHKEY_GATEWAY_LISTEN_PASSWORD");
@@ -97,15 +105,12 @@ impl Sandbox {
         path
     }
 
-    /// A router whose PATH starts with the sandbox, so the fake `curl`
-    /// is the system curl it finds.
-    fn router_with_fake_system_curl(&self) -> Command {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let mut dirs = vec![self.dir.clone()];
-        dirs.extend(std::env::split_paths(&path));
-        let mut command = self.router();
-        command.env("PATH", std::env::join_paths(dirs).unwrap());
-        command
+    /// The fake impersonator, rewritten to run `script` instead.
+    fn replace_impersonator(&self, script: &str) {
+        let _executables = EXECUTABLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fs::write(self.dir.join("curl-impersonate"), script).unwrap();
     }
 
     fn write_file(&self, name: &str, content: &str) -> PathBuf {
@@ -197,9 +202,9 @@ fn marked_invocation_execs_the_impersonator_with_the_default_profile() {
 }
 
 #[test]
-fn unmarked_invocation_execs_the_curl_on_path_without_the_matched_service_header() {
-    let sandbox = Sandbox::new("system-curl");
-    let got = run(sandbox.router_with_fake_system_curl().args([
+fn unmarked_invocation_execs_the_impersonator_untouched_without_the_matched_service_header() {
+    let sandbox = Sandbox::new("unmarked");
+    let got = run(sandbox.router().args([
         "-H",
         "X-Latchkey-Matched-Service: slack",
         "-sS",
@@ -210,7 +215,7 @@ fn unmarked_invocation_execs_the_curl_on_path_without_the_matched_service_header
     assert_eq!(
         got,
         lines(&[
-            "system-curl",
+            "impersonator",
             "-sS",
             "-H",
             "User-Agent: curl/8.7.1",
@@ -220,7 +225,7 @@ fn unmarked_invocation_execs_the_curl_on_path_without_the_matched_service_header
 }
 
 #[test]
-fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_gateway() {
+fn request_matching_the_desktop_proxy_config_execs_the_impersonator_against_the_gateway() {
     let sandbox = Sandbox::new("desktop-proxy");
     let config = sandbox.write_desktop_proxy_config(
         "desktop-proxy.json",
@@ -239,7 +244,7 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
         Duration::from_secs(20),
     );
     let got = run(sandbox
-        .router_with_fake_system_curl()
+        .router()
         .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
         // The password the gateway running the router listens with is not
         // the desktop's, and must not be the one sent.
@@ -255,7 +260,7 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
     assert_eq!(
         got,
         lines(&[
-            "system-curl",
+            "impersonator",
             "-H",
             "X-Latchkey-Gateway-No-Credentials: 1",
             "-H",
@@ -279,7 +284,7 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
         Duration::from_secs(30),
     );
     let got = run(sandbox
-        .router_with_fake_system_curl()
+        .router()
         .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
         .args([
             "-H",
@@ -289,7 +294,7 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
     assert_eq!(
         got,
         lines(&[
-            "system-curl",
+            "impersonator",
             "-H",
             "X-Latchkey-Gateway-No-Credentials: 1",
             "http://127.0.0.1:40001/gateway/https://slack.com/api/users.list",
@@ -305,7 +310,7 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
         Some("X-Latchkey-Matched-Service: github"),
         None,
     ] {
-        let mut command = sandbox.router_with_fake_system_curl();
+        let mut command = sandbox.router();
         command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config);
         if let Some(header) = matched_service_header {
             command.args(["-H", header]);
@@ -316,13 +321,17 @@ fn request_matching_the_desktop_proxy_config_execs_the_system_curl_against_the_g
             "https://slack.com/api/users.list",
         ]));
         assert_eq!(
-            got[0], "impersonator",
-            "{matched_service_header:?}: {got:?}"
-        );
-        assert!(
-            !got.iter()
-                .any(|line| line.contains("X-Latchkey-Matched-Service")),
-            "{matched_service_header:?}: {got:?}"
+            got,
+            lines(&[
+                "impersonator",
+                "--compressed",
+                "--noproxy",
+                "*",
+                "--impersonate",
+                "chrome150",
+                "https://slack.com/api/users.list",
+            ]),
+            "{matched_service_header:?}"
         );
     }
 }
@@ -336,7 +345,7 @@ fn desktop_proxy_config_that_cannot_be_used_is_an_error_not_a_direct_request() {
         (malformed, "expected a JSON object"),
         (missing, "cannot read"),
     ] {
-        let mut command = sandbox.router_with_fake_system_curl();
+        let mut command = sandbox.router();
         command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config).args([
             "-H",
             "X-Latchkey-Matched-Service: slack",
@@ -415,7 +424,7 @@ fn desktop_that_cannot_be_reached_is_an_error_not_a_direct_request() {
         if let Some((json, age)) = case.record {
             sandbox.write_device_record("desktop", json, Duration::from_secs(age));
         }
-        let mut command = sandbox.router_with_fake_system_curl();
+        let mut command = sandbox.router();
         if let Some((name, value)) = case.env {
             command.env(name, value);
         }
@@ -465,7 +474,7 @@ fn rules_are_tried_in_order_and_self_lets_the_request_out_from_here() {
         Duration::from_secs(20),
     );
     let slack = |sandbox: &Sandbox| {
-        let mut command = sandbox.router_with_fake_system_curl();
+        let mut command = sandbox.router();
         command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config);
         command.args([
             "-H",
@@ -478,7 +487,7 @@ fn rules_are_tried_in_order_and_self_lets_the_request_out_from_here() {
     assert_eq!(
         run(&mut slack(&sandbox)),
         lines(&[
-            "system-curl",
+            "impersonator",
             "-H",
             "X-Latchkey-Gateway-No-Credentials: 1",
             "-H",
@@ -493,12 +502,12 @@ fn rules_are_tried_in_order_and_self_lets_the_request_out_from_here() {
     fs::remove_file(sandbox.devices_dir().join("laptop-at-home.json")).unwrap();
     assert_eq!(
         run(&mut slack(&sandbox)),
-        lines(&["system-curl", "-sS", "https://slack.com/api/users.list"])
+        lines(&["impersonator", "-sS", "https://slack.com/api/users.list"])
     );
 
     // A service whose only rule is a desktop that stopped sending
     // keepalives has nowhere to send it.
-    let mut command = sandbox.router_with_fake_system_curl();
+    let mut command = sandbox.router();
     command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config).args([
         "-H",
         "X-Latchkey-Matched-Service: github",
@@ -518,7 +527,7 @@ fn rules_are_tried_in_order_and_self_lets_the_request_out_from_here() {
         Duration::from_secs(5),
     );
     let got = run(sandbox
-        .router_with_fake_system_curl()
+        .router()
         .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
         .args([
             "-H",
@@ -527,7 +536,7 @@ fn rules_are_tried_in_order_and_self_lets_the_request_out_from_here() {
         ]));
     assert_eq!(
         got,
-        lines(&["system-curl", "https://api.linear.app/graphql"])
+        lines(&["impersonator", "https://api.linear.app/graphql"])
     );
 }
 
@@ -553,7 +562,7 @@ fn the_device_header_picks_the_desktop_and_is_dropped() {
         Duration::from_secs(5),
     );
     let got = run(sandbox
-        .router_with_fake_system_curl()
+        .router()
         .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
         .args([
             "-H",
@@ -566,7 +575,7 @@ fn the_device_header_picks_the_desktop_and_is_dropped() {
     assert_eq!(
         got,
         lines(&[
-            "system-curl",
+            "impersonator",
             "-H",
             "X-Latchkey-Gateway-No-Credentials: 1",
             "-H",
@@ -637,7 +646,7 @@ fn a_device_header_the_rules_do_not_allow_is_refused() {
         },
     ];
     for case in cases {
-        let mut command = sandbox.router_with_fake_system_curl();
+        let mut command = sandbox.router();
         if let Some(config) = case.config {
             let path = sandbox.write_desktop_proxy_config("rules.json", config);
             command.env("LATCHKEY_DESKTOP_PROXY_CONFIG", &path);
@@ -658,5 +667,63 @@ fn a_device_header_the_rules_do_not_allow_is_refused() {
             output.stdout.is_empty(),
             "{name}: nothing should have been exec'd"
         );
+    }
+}
+
+/// The router never looks for a system curl, so a machine without one,
+/// or a PATH without one, makes no difference to an unmarked request.
+#[test]
+fn unmarked_invocation_needs_no_curl_on_path() {
+    let sandbox = Sandbox::new("no-curl-on-path");
+    let got = run(sandbox
+        .router()
+        .env("PATH", "")
+        .args(["-sS", "https://example.com/"]));
+    assert_eq!(got, lines(&["impersonator", "-sS", "https://example.com/"]));
+}
+
+/// libcurl-impersonate impersonates whenever `CURL_IMPERSONATE` is set,
+/// flag or no flag, so the routes meant to be a plain curl run without
+/// it. A marked request is impersonated anyway and keeps its environment.
+#[test]
+fn only_a_marked_invocation_keeps_the_impersonate_env() {
+    let sandbox = Sandbox::new("impersonate-env");
+    sandbox.replace_impersonator(
+        "#!/bin/sh\n\
+         echo \"CURL_IMPERSONATE=${CURL_IMPERSONATE-<unset>}\"\n\
+         echo \"CURL_IMPERSONATE_HEADERS=${CURL_IMPERSONATE_HEADERS-<unset>}\"\n",
+    );
+    let config = sandbox.write_desktop_proxy_config("rules.json", r#"{"slack": ["laptop"]}"#);
+    sandbox.write_device_record("laptop", r#"{"port": 40002}"#, Duration::from_secs(5));
+    let cleared = lines(&[
+        "CURL_IMPERSONATE=<unset>",
+        "CURL_IMPERSONATE_HEADERS=<unset>",
+    ]);
+    for (name, args, expected) in [
+        ("unmarked", &["https://example.com/"][..], cleared.clone()),
+        (
+            "desktop proxy",
+            &[
+                "-H",
+                "X-Latchkey-Matched-Service: slack",
+                "-H",
+                "X-Imbue-Impersonate: 1",
+                "https://slack.com/api/users.list",
+            ][..],
+            cleared.clone(),
+        ),
+        (
+            "marked",
+            &["-H", "X-Imbue-Impersonate: 1", "https://example.com/"][..],
+            lines(&["CURL_IMPERSONATE=chrome131", "CURL_IMPERSONATE_HEADERS=no"]),
+        ),
+    ] {
+        let got = run(sandbox
+            .router()
+            .env("LATCHKEY_DESKTOP_PROXY_CONFIG", &config)
+            .env("CURL_IMPERSONATE", "chrome131")
+            .env("CURL_IMPERSONATE_HEADERS", "no")
+            .args(args));
+        assert_eq!(got, expected, "{name}");
     }
 }

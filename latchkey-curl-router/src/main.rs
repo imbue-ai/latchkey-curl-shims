@@ -1,9 +1,9 @@
-//! `latchkey-curl-router` — a drop-in `curl` that routes each
-//! invocation to one of two real implementations, and optionally to a
-//! different destination. Impersonation is asked for by a private marker
-//! header in the arguments; the desktop proxy is chosen by looking up the
-//! service latchkey matched the request to, which it reports in another
-//! header, in a config file named in the environment. That file gives each
+//! `latchkey-curl-router` — a drop-in `curl` that decides, for each
+//! invocation, whether it impersonates Chrome and where it is sent.
+//! Impersonation is asked for by a private marker header in the
+//! arguments; the desktop proxy is chosen by looking up the service
+//! latchkey matched the request to, which it reports in another header,
+//! in a config file named in the environment. That file gives each
 //! service an ordered list of rules — a device id, or `self` — and the
 //! request leaves from the first of them that a connected desktop
 //! satisfies; `self` is this machine, and is what a service the config
@@ -11,14 +11,16 @@
 //! rules admit outright, with an `X-Latchkey-Device` header. It exists
 //! so a single `LATCHKEY_CURL` binary can serve impersonating and
 //! non-impersonating callers alike without breaking the latter: only
-//! callers that opt in get the Chrome-impersonating curl; everyone else
-//! keeps getting the system curl they expect.
+//! callers that opt in are impersonated; everyone else gets a plain curl.
 //!
-//! The impersonating curl is upstream `curl-impersonate` (shipped next to
-//! this binary as `curl-impersonate`), a real curl whose
-//! `--impersonate` flag selects a browser profile. This binary is what
-//! turns that flag on, so an impersonating invocation is rewritten, not
-//! forwarded verbatim; see [`impersonate_args`].
+//! Every route runs upstream `curl-impersonate` (shipped next to this
+//! binary as `curl-impersonate`), a real curl whose `--impersonate` flag
+//! selects a browser profile; the system curl is never used, so which CA
+//! store a request is verified against does not depend on the host's curl
+//! build. Without that flag, and with `CURL_IMPERSONATE` cleared from its
+//! environment, it is a plain curl. This binary is what turns the flag
+//! on, so an impersonating invocation is rewritten, not forwarded
+//! verbatim; see [`impersonate_args`].
 
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
@@ -114,6 +116,13 @@ const GATEWAY_NO_CREDENTIALS_HEADER: &str = "X-Latchkey-Gateway-No-Credentials: 
 /// this router side by side in the same dir, so a sibling lookup
 /// resolves it without any configuration.
 const IMPERSONATE_SIBLING_NAMES: &[&str] = &["curl-impersonate"];
+
+/// The env vars through which libcurl-impersonate impersonates a browser
+/// with no `--impersonate` flag: it reads them in every `curl_easy_init`.
+/// They are cleared for the routes that are meant to be a plain curl, so
+/// a value inherited from the caller cannot turn those into impersonated
+/// requests.
+const IMPERSONATE_ENV_VARS: &[&str] = &["CURL_IMPERSONATE", "CURL_IMPERSONATE_HEADERS"];
 
 /// Env var naming the `--impersonate` target. Passed through as-is:
 /// curl-impersonate rejects a name it does not know (exit 43, naming a
@@ -378,16 +387,18 @@ fn request_url(argv: &[String]) -> Option<&str> {
     (last.starts_with("http://") || last.starts_with("https://")).then_some(last.as_str())
 }
 
-/// Where an invocation goes; see the module docs for the order.
+/// Where an invocation goes; see the module docs for the order. Every
+/// route runs curl-impersonate; only [`Route::Impersonate`] turns
+/// impersonation on.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
-    /// Rewritten onto this desktop's latchkey gateway and run by the
-    /// system curl.
+    /// Rewritten onto this desktop's latchkey gateway and run as a plain
+    /// curl.
     DesktopProxy(DesktopGateway),
-    /// Handed to the Chrome-impersonating curl.
+    /// Rewritten to impersonate Chrome.
     Impersonate,
-    /// Handed to the system curl.
-    SystemCurl,
+    /// Run as a plain curl, untouched.
+    Plain,
 }
 
 /// The desktop proxy is decided first, by [`plan_desktop_proxy`]: a
@@ -398,7 +409,7 @@ fn choose_route(argv: &[String], gateway: Option<DesktopGateway>) -> Route {
     match gateway {
         Some(gateway) => Route::DesktopProxy(gateway),
         None if has_header(argv, MARKER_HEADER_NAME) => Route::Impersonate,
-        None => Route::SystemCurl,
+        None => Route::Plain,
     }
 }
 
@@ -755,10 +766,7 @@ fn sibling_of_exe(names: &[&str]) -> Option<PathBuf> {
 
 fn resolve_impersonator() -> PathBuf {
     sibling_of_exe(IMPERSONATE_SIBLING_NAMES).unwrap_or_else(|| {
-        die(
-            "impersonation requested but no impersonator curl found next to \
-             this binary (expected a curl-impersonate sibling)",
-        )
+        die("no curl found next to this binary (expected a curl-impersonate sibling)")
     })
 }
 
@@ -789,31 +797,8 @@ fn impersonation_profile() -> String {
     }
 }
 
-fn curl_on_path(self_exe: Option<&Path>) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("curl");
-        if !candidate.is_file() {
-            continue;
-        }
-        let canonical = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-        if self_exe == Some(canonical.as_path()) {
-            continue;
-        }
-        return Some(candidate);
-    }
-    None
-}
-
-fn resolve_real_curl(self_exe: Option<&Path>) -> PathBuf {
-    curl_on_path(self_exe).unwrap_or_else(|| die("no system curl found on $PATH"))
-}
-
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    let self_exe = std::env::current_exe()
-        .ok()
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
 
     let rules = DesktopProxyRules::from_env().unwrap_or_else(|message| die(message));
     let gateway = plan_desktop_proxy(&argv, rules.as_ref()).unwrap_or_else(|message| die(message));
@@ -821,21 +806,28 @@ fn main() {
     // Read above, and of no use to anyone after us: not to the desktop
     // gateway, which would forward them, nor to the third party.
     argv = without_headers(&argv, ROUTER_ONLY_HEADERS);
-    let target = match route {
+    let impersonate = match route {
         Route::DesktopProxy(gateway) => {
             argv =
                 rewrite_for_desktop_proxy(&argv, &gateway).unwrap_or_else(|message| die(message));
-            resolve_real_curl(self_exe.as_deref())
+            false
         }
         Route::Impersonate => {
             argv = impersonate_args(&argv, &impersonation_profile());
-            resolve_impersonator()
+            true
         }
-        Route::SystemCurl => resolve_real_curl(self_exe.as_deref()),
+        Route::Plain => false,
     };
 
+    let target = resolve_impersonator();
+    let mut command = Command::new(&target);
+    if !impersonate {
+        for name in IMPERSONATE_ENV_VARS {
+            command.env_remove(name);
+        }
+    }
     // `exec` replaces this process on success and only returns on error.
-    let err = Command::new(&target).args(&argv).exec();
+    let err = command.args(&argv).exec();
     die(format!("failed to exec {}: {err}", target.display()));
 }
 
@@ -902,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_unmarked_invocations_to_the_system_curl() {
+    fn does_not_find_a_marker_in_an_unmarked_invocation() {
         let tokens = argv(&["-sS", "-H", "Accept: */*", "https://example.com/"]);
         assert!(!has_header(&tokens, MARKER_HEADER_NAME));
     }
@@ -1224,7 +1216,7 @@ mod tests {
         );
         assert_eq!(
             choose_route(&argv(&["https://slack.com/api/users.list"]), None),
-            Route::SystemCurl
+            Route::Plain
         );
     }
 
