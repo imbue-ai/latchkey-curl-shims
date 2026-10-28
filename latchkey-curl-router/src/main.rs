@@ -18,12 +18,16 @@
 //! this binary as `curl-impersonate`), a real curl whose
 //! `--impersonate` flag selects a browser profile. This binary is what
 //! turns that flag on, so an impersonating invocation is rewritten, not
-//! forwarded verbatim; see [`impersonate_args`].
+//! forwarded verbatim; see [`impersonate_args`]. The rewrite makes curl
+//! decode the body, which its header dump does not reflect, so when the
+//! invocation dumps headers to a file the router stays around to fix the
+//! dump up afterwards; see [`WIRE_BODY_HEADERS`].
 
 use std::collections::BTreeMap;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use serde::de::Error as _;
@@ -768,7 +772,8 @@ fn resolve_impersonator() -> PathBuf {
 /// `--compressed` is required, not cosmetic: the profile advertises
 /// `Accept-Encoding: gzip, deflate, br, zstd` as part of looking like
 /// Chrome, and without this flag curl hands the caller the still-encoded
-/// body. `--noproxy '*'` keeps `HTTP(S)_PROXY` and the macOS proxy pane
+/// body (its header dump keeps describing the encoded one, which
+/// [`WIRE_BODY_HEADERS`] is about). `--noproxy '*'` keeps `HTTP(S)_PROXY` and the macOS proxy pane
 /// out of a request that carries the user's credentials — deliberately
 /// stricter than plain curl, which honors them.
 fn impersonate_args(argv: &[String], profile: &str) -> Vec<String> {
@@ -780,6 +785,128 @@ fn impersonate_args(argv: &[String], profile: &str) -> Vec<String> {
     );
     rewritten.extend(without_headers(argv, IMPERSONATE_STRIPPED_HEADERS));
     rewritten
+}
+
+/// Response headers that describe the body as it came off the wire.
+/// `--compressed` makes curl decode the body, but `-D` records the
+/// headers as received, so a caller that re-serves the body from the
+/// dump (latchkey's gateway does) would frame a decoded body with the
+/// encoded one's length and coding. The router removes them from the
+/// dump once curl is done. The decoded length is not knowable here, since
+/// the body goes to the caller's stdout, and a response without one is
+/// framed by whoever sends it on.
+const WIRE_BODY_HEADERS: &[&str] = &["Content-Encoding", "Content-Length"];
+
+/// The file a `-D` / `--dump-header` in `argv` writes the response
+/// headers to. `None` without one, or when the headers go to stdout
+/// (`-D -`), where they are interleaved with the body and out of reach.
+/// The last one wins, as in curl. Only the spellings latchkey uses are
+/// recognised: a separate value, or one attached as `-Dfile` or
+/// `--dump-header=file`; a bundle like `-sD` is not.
+fn header_dump_file(argv: &[String]) -> Option<PathBuf> {
+    let mut file: Option<&str> = None;
+    let mut it = argv.iter();
+    while let Some(tok) = it.next() {
+        if is_header_flag(tok) {
+            // A header's value is never a flag.
+            it.next();
+            continue;
+        }
+        let value = if tok == "-D" || tok == "--dump-header" {
+            it.next().map(String::as_str)
+        } else if let Some(attached) = tok.strip_prefix("--dump-header=") {
+            Some(attached)
+        } else {
+            tok.strip_prefix("-D")
+        };
+        if value.is_some() {
+            file = value;
+        }
+    }
+    match file {
+        Some(path) if path != "-" => Some(PathBuf::from(path)),
+        _ => None,
+    }
+}
+
+fn is_wire_body_header_line(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|&byte| byte == b':') else {
+        return false;
+    };
+    let name = line[..colon].trim_ascii();
+    WIRE_BODY_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header.as_bytes()))
+}
+
+/// `dump` without the [`WIRE_BODY_HEADERS`] lines, in every header block
+/// (a redirect or a `100 Continue` adds one). Everything else is kept
+/// byte for byte, line endings included.
+fn without_wire_body_headers(dump: &[u8]) -> Vec<u8> {
+    dump.split_inclusive(|&byte| byte == b'\n')
+        .filter(|line| !is_wire_body_header_line(line))
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// The impersonator while [`run_impersonator_and_fix_header_dump`] waits
+/// on it, for [`forward_signal`]; 0 before it is spawned.
+static IMPERSONATOR_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Passes a signal the router received on to the impersonator, so that
+/// killing the router (a caller's timeout does) ends the transfer the
+/// way it did when the router exec'd curl.
+extern "C" fn forward_signal(signal: libc::c_int) {
+    let pid = IMPERSONATOR_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: `kill` is async-signal-safe, and the pid is a child of
+        // ours that has not been waited on yet.
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+/// Runs the impersonator to completion instead of exec'ing it, removes
+/// the [`WIRE_BODY_HEADERS`] from the header dump it wrote, and exits the
+/// way it did. Only for a marked invocation that dumps headers to a file;
+/// every other invocation is exec'd and never comes back here.
+fn run_impersonator_and_fix_header_dump(target: &Path, argv: &[String], dump: &Path) -> ! {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: the handler only reads an atomic and calls `kill`.
+        unsafe {
+            libc::signal(
+                signal,
+                forward_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            );
+        }
+    }
+    let mut child = Command::new(target)
+        .args(argv)
+        .spawn()
+        .unwrap_or_else(|err| die(format!("failed to run {}: {err}", target.display())));
+    IMPERSONATOR_PID.store(child.id() as i32, Ordering::SeqCst);
+    let status = child
+        .wait()
+        .unwrap_or_else(|err| die(format!("failed to wait for {}: {err}", target.display())));
+    IMPERSONATOR_PID.store(0, Ordering::SeqCst);
+
+    // No dump means curl never got a response; nothing to fix.
+    if let Ok(bytes) = std::fs::read(dump) {
+        if let Err(err) = std::fs::write(dump, without_wire_body_headers(&bytes)) {
+            warn(format!(
+                "could not rewrite header dump {}: {err}",
+                dump.display()
+            ));
+        }
+    }
+
+    match status.code() {
+        Some(code) => std::process::exit(code),
+        // Killed by a signal: the exit status a shell would report.
+        None => std::process::exit(128 + status.signal().unwrap_or(0)),
+    }
 }
 
 fn impersonation_profile() -> String {
@@ -828,8 +955,13 @@ fn main() {
             resolve_real_curl(self_exe.as_deref())
         }
         Route::Impersonate => {
+            let header_dump = header_dump_file(&argv);
             argv = impersonate_args(&argv, &impersonation_profile());
-            resolve_impersonator()
+            let impersonator = resolve_impersonator();
+            if let Some(dump) = header_dump {
+                run_impersonator_and_fix_header_dump(&impersonator, &argv, &dump);
+            }
+            impersonator
         }
         Route::SystemCurl => resolve_real_curl(self_exe.as_deref()),
     };
@@ -1850,6 +1982,78 @@ mod tests {
         ] {
             let result = rewrite_for_desktop_proxy(&tokens, &gateway_without_secrets());
             assert!(result.is_err(), "unexpectedly rewrote {tokens:?}");
+        }
+    }
+
+    #[test]
+    fn header_dump_file_is_the_last_dump_flag_unless_it_is_stdout() {
+        for tokens in [
+            argv(&["-sS", "-D", "/tmp/h", "https://example.com/"]),
+            argv(&["--dump-header", "/tmp/h", "https://example.com/"]),
+            argv(&["--dump-header=/tmp/h", "https://example.com/"]),
+            argv(&["-D/tmp/h", "https://example.com/"]),
+            argv(&["-D", "/tmp/first", "-D", "/tmp/h", "https://example.com/"]),
+        ] {
+            assert_eq!(
+                header_dump_file(&tokens),
+                Some(PathBuf::from("/tmp/h")),
+                "{tokens:?}"
+            );
+        }
+        assert_eq!(
+            header_dump_file(&argv(&["-D", "-", "https://example.com/"])),
+            None
+        );
+        assert_eq!(
+            header_dump_file(&argv(&["-sS", "https://example.com/"])),
+            None
+        );
+    }
+
+    /// A header's value is consumed with its flag, so one that looks like
+    /// a dump flag is not read as one.
+    #[test]
+    fn header_dump_file_ignores_header_values() {
+        let tokens = argv(&[
+            "-H",
+            "-D",
+            "-H",
+            "X-Note: --dump-header=/tmp/h",
+            "https://example.com/",
+        ]);
+        assert_eq!(header_dump_file(&tokens), None);
+    }
+
+    #[test]
+    fn wire_body_headers_are_removed_from_every_block_and_nothing_else_changes() {
+        let dump = b"HTTP/1.1 100 Continue\r\n\r\n\
+            HTTP/2 200\r\n\
+            content-type: application/json\r\n\
+            Content-Encoding: br\r\n\
+            CONTENT-LENGTH: 127\r\n\
+            x-slack-req-id: abc\r\n\
+            content-length-policy: keep\r\n\
+            \r\n";
+        assert_eq!(
+            without_wire_body_headers(dump),
+            b"HTTP/1.1 100 Continue\r\n\r\n\
+            HTTP/2 200\r\n\
+            content-type: application/json\r\n\
+            x-slack-req-id: abc\r\n\
+            content-length-policy: keep\r\n\
+            \r\n"
+        );
+    }
+
+    #[test]
+    fn a_dump_without_wire_body_headers_is_returned_as_is() {
+        for dump in [
+            &b""[..],
+            b"HTTP/2 200\r\ncontent-type: text/plain\r\n\r\n",
+            b"HTTP/1.1 200 OK\ncontent-type: text/plain\n\n",
+            b"HTTP/2 200\r\nx-raw: \xff\xfe\r\n\r\n",
+        ] {
+            assert_eq!(without_wire_body_headers(dump), dump);
         }
     }
 }

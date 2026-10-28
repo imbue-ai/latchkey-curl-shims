@@ -660,3 +660,202 @@ fn a_device_header_the_rules_do_not_allow_is_refused() {
         );
     }
 }
+
+/// What curl-impersonate writes to the `-D` file: the headers as the
+/// server sent them, describing the brotli body `--compressed` then
+/// decoded.
+const WIRE_DUMP: &str = "HTTP/2 200\r\n\
+    content-type: application/json\r\n\
+    content-encoding: br\r\n\
+    content-length: 127\r\n\
+    x-slack-req-id: abc\r\n\
+    \r\n";
+
+/// [`WIRE_DUMP`] as the router leaves it.
+const FIXED_DUMP: &str = "HTTP/2 200\r\n\
+    content-type: application/json\r\n\
+    x-slack-req-id: abc\r\n\
+    \r\n";
+
+/// A fake `name` that prints its argv like [`write_fake`], writes `dump`
+/// to the file named after `-D`, and exits with `code`.
+fn write_fake_with_header_dump(dir: &Path, name: &str, banner: &str, dump: &str, code: i32) {
+    let _executables = EXECUTABLES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let printf_format = dump.replace('\r', "\\r").replace('\n', "\\n");
+    let path = dir.join(name);
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             echo \"{banner}\"\n\
+             printf '%s\\n' \"$@\"\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 if [ \"$1\" = -D ]; then printf '{printf_format}' > \"$2\"; fi\n\
+             \x20 shift\n\
+             done\n\
+             exit {code}\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn marked_invocation_dumping_headers_to_a_file_gets_the_dump_without_the_wire_body_headers() {
+    let sandbox = Sandbox::new("header-dump");
+    write_fake_with_header_dump(
+        &sandbox.dir,
+        "curl-impersonate",
+        "impersonator",
+        WIRE_DUMP,
+        0,
+    );
+    let dump = sandbox.dir.join("headers");
+    let dump_argument = dump.to_str().unwrap();
+    let got = run(sandbox.router().args([
+        "-sS",
+        "-D",
+        dump_argument,
+        "-H",
+        "X-Imbue-Impersonate: 1",
+        "https://example.com/",
+    ]));
+    assert_eq!(
+        got,
+        lines(&[
+            "impersonator",
+            "--compressed",
+            "--noproxy",
+            "*",
+            "--impersonate",
+            "chrome150",
+            "-sS",
+            "-D",
+            dump_argument,
+            "https://example.com/",
+        ])
+    );
+    assert_eq!(fs::read(&dump).unwrap(), FIXED_DUMP.as_bytes());
+}
+
+#[test]
+fn the_impersonators_exit_status_is_the_routers_when_it_fixes_the_dump() {
+    let sandbox = Sandbox::new("header-dump-exit-status");
+    write_fake_with_header_dump(
+        &sandbox.dir,
+        "curl-impersonate",
+        "impersonator",
+        WIRE_DUMP,
+        22,
+    );
+    let dump = sandbox.dir.join("headers");
+    let output = output(sandbox.router().args([
+        "-D",
+        dump.to_str().unwrap(),
+        "-H",
+        "X-Imbue-Impersonate: 1",
+        "https://example.com/",
+    ]));
+    assert_eq!(output.status.code(), Some(22));
+    assert_eq!(fs::read(&dump).unwrap(), FIXED_DUMP.as_bytes());
+}
+
+#[test]
+fn marked_invocation_dumping_headers_to_stdout_is_execd_untouched() {
+    let sandbox = Sandbox::new("header-dump-stdout");
+    let got = run(sandbox.router().args([
+        "-D",
+        "-",
+        "-H",
+        "X-Imbue-Impersonate: 1",
+        "https://example.com/",
+    ]));
+    assert_eq!(
+        got,
+        lines(&[
+            "impersonator",
+            "--compressed",
+            "--noproxy",
+            "*",
+            "--impersonate",
+            "chrome150",
+            "-D",
+            "-",
+            "https://example.com/",
+        ])
+    );
+}
+
+#[test]
+fn unmarked_invocation_leaves_the_header_dump_as_curl_wrote_it() {
+    let sandbox = Sandbox::new("header-dump-unmarked");
+    write_fake_with_header_dump(&sandbox.dir, "curl", "system-curl", WIRE_DUMP, 0);
+    let dump = sandbox.dir.join("headers");
+    run(sandbox.router_with_fake_system_curl().args([
+        "-sS",
+        "-D",
+        dump.to_str().unwrap(),
+        "https://example.com/",
+    ]));
+    assert_eq!(fs::read(&dump).unwrap(), WIRE_DUMP.as_bytes());
+}
+
+/// A caller that kills the router (latchkey's timeout does) must end the
+/// transfer, as it did when the router exec'd curl.
+#[test]
+fn a_signal_to_the_waiting_router_reaches_the_impersonator() {
+    let sandbox = Sandbox::new("header-dump-signal");
+    {
+        let _executables = EXECUTABLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = sandbox.dir.join("curl-impersonate");
+        // `wait` returns when the trapped signal arrives; a foreground
+        // `sleep` would hold the trap until it finished.
+        fs::write(
+            &path,
+            "#!/bin/sh\ntrap 'exit 7' TERM\nsleep 30 &\nwait $!\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let dump = sandbox.dir.join("headers");
+    let mut router = {
+        let _executables = EXECUTABLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sandbox
+            .router()
+            .args([
+                "-D",
+                dump.to_str().unwrap(),
+                "-H",
+                "X-Imbue-Impersonate: 1",
+                "https://example.com/",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(Command::new("kill")
+        .args(["-TERM", &router.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = SystemTime::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = router.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            SystemTime::now() < deadline,
+            "router did not exit after SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(7));
+}
