@@ -18,7 +18,9 @@
 //! this binary as `curl-impersonate`), a real curl whose
 //! `--impersonate` flag selects a browser profile. This binary is what
 //! turns that flag on, so an impersonating invocation is rewritten, not
-//! forwarded verbatim; see [`impersonate_args`].
+//! forwarded verbatim; see [`impersonate_args`]. The reply comes back as
+//! the server sent it, compressed the way Chrome asked for; the caller
+//! decodes it with its own `--compressed`.
 
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
@@ -31,7 +33,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 /// Name of the private routing marker header. Namespaced so it can't
-/// collide with a header a caller legitimately wants to set or strip.
+/// collide with a header a caller legitimately wants to set or strip. Its
+/// value names the `--impersonate` profile; see [`impersonation_profile`].
 const MARKER_HEADER_NAME: &str = "X-Imbue-Impersonate";
 
 /// Env var naming the JSON file that says which requests leave from one of
@@ -115,23 +118,45 @@ const GATEWAY_NO_CREDENTIALS_HEADER: &str = "X-Latchkey-Gateway-No-Credentials: 
 /// resolves it without any configuration.
 const IMPERSONATE_SIBLING_NAMES: &[&str] = &["curl-impersonate"];
 
-/// Env var naming the `--impersonate` target. Passed through as-is:
-/// curl-impersonate rejects a name it does not know (exit 43, naming a
-/// valid one), which is the loud failure we want rather than a fallback
-/// to some other fingerprint.
+/// Env var naming the `--impersonate` target when the marker's value does
+/// not. Either is passed through as-is: curl-impersonate rejects a name it
+/// does not know (exit 43, naming a valid one), which is the loud failure
+/// we want rather than a fallback to some other fingerprint.
 const PROFILE_ENV: &str = "DATALIB_IMPERSONATE_PROFILE";
 
-/// The profile used when [`PROFILE_ENV`] is unset. Its JA4 and HTTP/2
-/// fingerprints matched a real Chromium 152 when it was chosen
-/// (2026-09-11, `tls.browserleaks.com`); bump it as Chrome moves.
+/// The profile used when neither the marker nor [`PROFILE_ENV`] names one.
+/// Its JA4 and HTTP/2 fingerprints matched a real Chromium 152 when it was
+/// chosen (2026-09-11, `tls.browserleaks.com`); bump it as Chrome moves.
 const DEFAULT_PROFILE: &str = "chrome150";
 
-/// Headers the caller may not set on an impersonated request: the marker
-/// is ours and must not reach the wire, and a `User-Agent` would override
-/// the one the profile sends (curl lets `-H` replace any header). The
-/// latchkey gateway forwards its own client's `User-Agent: curl/...`, so
-/// the second is the normal case, not a corner.
-const IMPERSONATE_STRIPPED_HEADERS: &[&str] = &[MARKER_HEADER_NAME, "User-Agent"];
+/// The marker value that selects the default profile, from before the
+/// value named a profile. Still what datalib sends.
+const MARKER_DEFAULT_PROFILE_VALUE: &str = "1";
+
+/// Headers the caller may not set on an impersonated request. The marker
+/// is ours and must not reach the wire. The rest describe the browser
+/// rather than the request: the profile sends each of them with Chrome's
+/// value, curl lets a caller's `-H` replace any of them, and a non-Chrome
+/// value next to Chrome's TLS fingerprint is what bot walls look for. The
+/// latchkey gateway forwards its own client's `User-Agent: curl/...` and
+/// `Accept-Encoding`, so these are the normal case, not a corner. `Accept`
+/// stays the caller's: it describes the request, and Chrome itself sends
+/// many values of it.
+const IMPERSONATE_STRIPPED_HEADERS: &[&str] = &[
+    MARKER_HEADER_NAME,
+    "User-Agent",
+    "Accept-Encoding",
+    "Accept-Language",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "Sec-Fetch-Site",
+    "Sec-Fetch-Mode",
+    "Sec-Fetch-User",
+    "Sec-Fetch-Dest",
+    "Upgrade-Insecure-Requests",
+    "Priority",
+];
 
 fn die(msg: impl AsRef<str>) -> ! {
     eprintln!("latchkey-curl-router: {}", msg.as_ref());
@@ -764,17 +789,22 @@ fn resolve_impersonator() -> PathBuf {
 
 /// The argv handed to curl-impersonate for a marked invocation.
 ///
-/// Three flags go in front. `--impersonate <profile>` is the whole point.
-/// `--compressed` is required, not cosmetic: the profile advertises
-/// `Accept-Encoding: gzip, deflate, br, zstd` as part of looking like
-/// Chrome, and without this flag curl hands the caller the still-encoded
-/// body. `--noproxy '*'` keeps `HTTP(S)_PROXY` and the macOS proxy pane
-/// out of a request that carries the user's credentials — deliberately
-/// stricter than plain curl, which honors them.
+/// Two flags go in front. `--impersonate <profile>` is the whole point.
+/// `--noproxy '*'` keeps `HTTP(S)_PROXY` and the macOS proxy pane out of
+/// a request that carries the user's credentials — deliberately stricter
+/// than plain curl, which honors them.
+///
+/// The profile advertises `Accept-Encoding: gzip, deflate, br, zstd` as
+/// part of looking like Chrome, so the reply comes back compressed, and it
+/// is handed on that way: `--compressed` is deliberately not added. curl
+/// would decode the body but keep describing the encoded one in its header
+/// dump, and a caller that re-serves the body from that dump (latchkey's
+/// gateway does) would frame it with the wrong length. Decoding belongs to
+/// the curl at the last hop, the caller's own: `latchkey curl --compressed`.
 fn impersonate_args(argv: &[String], profile: &str) -> Vec<String> {
-    let mut rewritten = Vec::with_capacity(argv.len() + 5);
+    let mut rewritten = Vec::with_capacity(argv.len() + 4);
     rewritten.extend(
-        ["--compressed", "--noproxy", "*", "--impersonate", profile]
+        ["--noproxy", "*", "--impersonate", profile]
             .into_iter()
             .map(str::to_string),
     );
@@ -782,10 +812,18 @@ fn impersonate_args(argv: &[String], profile: &str) -> Vec<String> {
     rewritten
 }
 
-fn impersonation_profile() -> String {
-    match std::env::var(PROFILE_ENV) {
-        Ok(value) if !value.is_empty() => value,
-        _ => DEFAULT_PROFILE.to_string(),
+/// The `--impersonate` target: the marker's value when it names one, else
+/// [`PROFILE_ENV`], else [`DEFAULT_PROFILE`]. An empty value and
+/// [`MARKER_DEFAULT_PROFILE_VALUE`] both mean "the default".
+fn impersonation_profile(marker_value: Option<&str>) -> String {
+    match marker_value {
+        Some(value) if !value.is_empty() && value != MARKER_DEFAULT_PROFILE_VALUE => {
+            value.to_string()
+        }
+        _ => match std::env::var(PROFILE_ENV) {
+            Ok(value) if !value.is_empty() => value,
+            _ => DEFAULT_PROFILE.to_string(),
+        },
     }
 }
 
@@ -828,7 +866,8 @@ fn main() {
             resolve_real_curl(self_exe.as_deref())
         }
         Route::Impersonate => {
-            argv = impersonate_args(&argv, &impersonation_profile());
+            let profile = impersonation_profile(header_value(&argv, MARKER_HEADER_NAME));
+            argv = impersonate_args(&argv, &profile);
             resolve_impersonator()
         }
         Route::SystemCurl => resolve_real_curl(self_exe.as_deref()),
@@ -1478,9 +1517,10 @@ mod tests {
     }
 
     /// The shape the latchkey gateway hands us — its client's
-    /// `User-Agent: curl/...` included — becomes a curl-impersonate
-    /// invocation: the profile flags in front, the marker and the UA
-    /// gone, everything else untouched and in order.
+    /// `User-Agent: curl/...` and `Accept-Encoding` included — becomes a
+    /// curl-impersonate invocation: the profile flags in front, the marker
+    /// and the browser-identity headers gone, everything else untouched
+    /// and in order.
     #[test]
     fn impersonate_rewrite_adds_the_profile_flags_and_strips_our_headers() {
         let rewritten = impersonate_args(
@@ -1495,6 +1535,8 @@ mod tests {
                 "-H",
                 "User-Agent: curl/8.7.1",
                 "-H",
+                "Accept-Encoding: deflate, gzip, br, zstd",
+                "-H",
                 "Accept: application/json",
                 "-H",
                 "X-Imbue-Impersonate: 1",
@@ -1507,7 +1549,6 @@ mod tests {
         assert_eq!(
             rewritten,
             argv(&[
-                "--compressed",
                 "--noproxy",
                 "*",
                 "--impersonate",
@@ -1528,26 +1569,38 @@ mod tests {
         );
     }
 
-    /// Every spelling the marker and a User-Agent can arrive in is
-    /// dropped: curl matches header names case-insensitively and accepts
-    /// both the `Name: value` and the valueless `Name;` forms.
+    /// Every spelling the marker and a browser-identity header can arrive
+    /// in is dropped: curl matches header names case-insensitively and
+    /// accepts both the `Name: value` and the valueless `Name;` forms.
     #[test]
     fn impersonate_rewrite_strips_every_spelling_of_our_headers() {
         for header in [
             "X-Imbue-Impersonate: 1",
             "X-Imbue-Impersonate:",
             "X-Imbue-Impersonate;",
+            "X-Imbue-Impersonate: chrome131",
             "x-imbue-impersonate: 1",
             "User-Agent: curl/8.7.1",
             "user-agent: curl/8.7.1",
             "USER-AGENT;",
+            "Accept-Encoding: gzip",
+            "accept-encoding: deflate, gzip, br, zstd",
+            "Accept-Language: de",
+            "sec-ch-ua: \"Chromium\";v=\"131\"",
+            "Sec-CH-UA-Mobile: ?1",
+            "sec-ch-ua-platform: \"Linux\"",
+            "Sec-Fetch-Site: cross-site",
+            "Sec-Fetch-Mode: cors",
+            "Sec-Fetch-User: ?0",
+            "Sec-Fetch-Dest: empty",
+            "Upgrade-Insecure-Requests: 0",
+            "Priority: u=3",
         ] {
             let rewritten =
                 impersonate_args(&argv(&["-H", header, "https://example.com/"]), "chrome150");
             assert_eq!(
                 rewritten,
                 argv(&[
-                    "--compressed",
                     "--noproxy",
                     "*",
                     "--impersonate",
@@ -1578,7 +1631,6 @@ mod tests {
         assert_eq!(
             rewritten,
             argv(&[
-                "--compressed",
                 "--noproxy",
                 "*",
                 "--impersonate",
@@ -1600,7 +1652,6 @@ mod tests {
         assert_eq!(
             rewritten,
             argv(&[
-                "--compressed",
                 "--noproxy",
                 "*",
                 "--impersonate",
@@ -1851,5 +1902,35 @@ mod tests {
             let result = rewrite_for_desktop_proxy(&tokens, &gateway_without_secrets());
             assert!(result.is_err(), "unexpectedly rewrote {tokens:?}");
         }
+    }
+
+    /// The marker's value is the profile; `1` (what datalib sends) and an
+    /// empty value defer to the environment or the default, whichever
+    /// `impersonation_profile(None)` resolves to in this process.
+    #[test]
+    fn marker_value_names_the_profile_and_the_old_value_means_the_default() {
+        assert_eq!(impersonation_profile(Some("chrome131")), "chrome131");
+        assert_eq!(impersonation_profile(Some("firefox147")), "firefox147");
+        let default = impersonation_profile(None);
+        assert_eq!(impersonation_profile(Some("1")), default);
+        assert_eq!(impersonation_profile(Some("")), default);
+    }
+
+    /// `header_value` is how the marker's value reaches
+    /// `impersonation_profile`: every spelling resolves.
+    #[test]
+    fn marker_profile_is_read_from_any_spelling_of_the_header() {
+        let profile = |header: &str| {
+            impersonation_profile(header_value(
+                &argv(&["-sS", "-H", header, "https://example.com/"]),
+                MARKER_HEADER_NAME,
+            ))
+        };
+        assert_eq!(profile("X-Imbue-Impersonate: chrome131"), "chrome131");
+        assert_eq!(profile("x-imbue-impersonate:chrome131"), "chrome131");
+        let default = impersonation_profile(None);
+        assert_eq!(profile("X-Imbue-Impersonate: 1"), default);
+        assert_eq!(profile("X-Imbue-Impersonate;"), default);
+        assert_eq!(profile("X-Imbue-Impersonate:"), default);
     }
 }
