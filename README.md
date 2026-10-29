@@ -7,7 +7,7 @@ expects:
 
 | binary | what it is |
 |---|---|
-| `latchkey-curl-router` | The `curl` that `LATCHKEY_CURL` points at. A small Rust program: an invocation whose service's desktop-proxy rules (below) name a connected desktop is rewritten onto the latchkey gateway on that computer. Otherwise, an invocation carrying the private `X-Imbue-Impersonate` header is rewritten (that header and any `User-Agent` dropped, `--compressed --noproxy '*' --impersonate <profile>` put in front) and handed to the impersonating curl next to it. Anything else goes to the system `curl` untouched. |
+| `latchkey-curl-router` | The `curl` that `LATCHKEY_CURL` points at. A small Rust program: an invocation whose service's desktop-proxy rules (below) name a connected desktop is rewritten onto the latchkey gateway on that computer. Otherwise, an invocation carrying the private `X-Imbue-Impersonate` header is rewritten (that header and the caller's browser-identity headers dropped, `--impersonate <profile>` put in front; the profile comes from the header's value, see below) and handed to the impersonating curl next to it. Anything else goes to the system `curl` untouched. |
 | `curl-impersonate` | Upstream [curl-impersonate](https://github.com/lexiforest/curl-impersonate), unmodified: a curl with a patched BoringSSL and a built-in `--impersonate <browser>` flag that presents Chrome's TLS and HTTP/2 fingerprint. **On its own it does not impersonate**: without `--impersonate` it is a plain curl 8.x and gets the same `403` a stock curl does. The router is what adds the flag. |
 
 Some of the hosts datalib mirrors, `claude.ai` and `chatgpt.com` today,
@@ -24,13 +24,33 @@ impersonating request looks like this:
 
 ```sh
 LATCHKEY_CURL=/path/to/latchkey-curl-router \
-    latchkey curl -sS -H 'X-Imbue-Impersonate: 1' https://claude.ai/api/organizations
+    latchkey curl -sS --compressed -H 'X-Imbue-Impersonate: 1' https://claude.ai/api/organizations
 ```
 
-The `--impersonate` target is `DATALIB_IMPERSONATE_PROFILE`, default
-`chrome150`. It is passed through as-is; a name curl-impersonate does
-not know fails the request with exit 43 and a message naming a valid
-one.
+Pass `--compressed` yourself. The Chrome profile advertises
+`Accept-Encoding: gzip, deflate, br, zstd`, so the reply comes back
+compressed, and the router hands it on that way rather than asking the
+impersonating curl to decode it: curl's `-D` header dump would keep
+describing the encoded body, and anything that re-serves the body from
+that dump (latchkey's gateway does) would frame it with the wrong
+length. Decoding is the job of the curl at the last hop, the one you
+run. Through a latchkey gateway that is the workspace's `curl`, which
+must be able to decode every coding Chrome advertises (Debian's and
+Ubuntu's can).
+
+The marker's value names the `--impersonate` target:
+`X-Imbue-Impersonate: chrome131` asks for that profile, and `1` (the
+original spelling) or an empty value asks for the default, which is
+`DATALIB_IMPERSONATE_PROFILE` if set, else `chrome150`. Either is
+passed through as-is; a name curl-impersonate does not know fails the
+request with exit 43 and a message naming a valid one.
+
+On a marked request the router drops the caller's copies of the headers
+the profile sends with Chrome's values, since curl would otherwise let
+them replace the profile's: `User-Agent`, `Accept-Encoding`,
+`Accept-Language`, the `sec-ch-ua*` client hints, the `Sec-Fetch-*`
+headers, `Upgrade-Insecure-Requests` and `Priority`. `Accept` and every
+other header stay the caller's.
 
 ## The desktop proxy
 

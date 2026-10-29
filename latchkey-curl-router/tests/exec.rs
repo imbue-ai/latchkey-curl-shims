@@ -163,9 +163,6 @@ fn marked_invocation_execs_the_impersonator_with_the_explicit_profile() {
         got,
         lines(&[
             "impersonator",
-            "--compressed",
-            "--noproxy",
-            "*",
             "--impersonate",
             "chrome131",
             "-sS",
@@ -186,9 +183,6 @@ fn marked_invocation_execs_the_impersonator_with_the_default_profile() {
         got,
         lines(&[
             "impersonator",
-            "--compressed",
-            "--noproxy",
-            "*",
             "--impersonate",
             "chrome150",
             "https://example.com/",
@@ -659,4 +653,62 @@ fn a_device_header_the_rules_do_not_allow_is_refused() {
             "{name}: nothing should have been exec'd"
         );
     }
+}
+
+#[test]
+fn the_marker_value_names_the_profile_over_the_environment() {
+    let sandbox = Sandbox::new("marker-profile");
+    let got = run(sandbox
+        .router()
+        .env("DATALIB_IMPERSONATE_PROFILE", "chrome131")
+        .args([
+            "-H",
+            "X-Imbue-Impersonate: firefox147",
+            "https://example.com/",
+        ]));
+    assert_eq!(
+        got,
+        lines(&[
+            "impersonator",
+            "--impersonate",
+            "firefox147",
+            "https://example.com/",
+        ])
+    );
+}
+
+/// What the latchkey gateway forwards from a `latchkey curl --compressed`
+/// client: its `Accept-Encoding` and `User-Agent` go, so the profile's
+/// stand; `Accept` and the credentials stay.
+#[test]
+fn marked_invocation_keeps_only_the_callers_request_headers() {
+    let sandbox = Sandbox::new("strip-identity-headers");
+    let got = run(sandbox.router().args([
+        "-sS",
+        "-H",
+        "User-Agent: curl/8.14.1",
+        "-H",
+        "Accept-Encoding: deflate, gzip, br, zstd",
+        "-H",
+        "Accept: application/json",
+        "-H",
+        "Authorization: Bearer xoxb-token",
+        "-H",
+        "X-Imbue-Impersonate: 1",
+        "https://slack.com/api/auth.test",
+    ]));
+    assert_eq!(
+        got,
+        lines(&[
+            "impersonator",
+            "--impersonate",
+            "chrome150",
+            "-sS",
+            "-H",
+            "Accept: application/json",
+            "-H",
+            "Authorization: Bearer xoxb-token",
+            "https://slack.com/api/auth.test",
+        ])
+    );
 }
