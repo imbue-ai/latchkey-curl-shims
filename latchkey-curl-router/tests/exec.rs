@@ -163,8 +163,6 @@ fn marked_invocation_execs_the_impersonator_with_the_explicit_profile() {
         got,
         lines(&[
             "impersonator",
-            "--noproxy",
-            "*",
             "--impersonate",
             "chrome131",
             "-sS",
@@ -185,8 +183,6 @@ fn marked_invocation_execs_the_impersonator_with_the_default_profile() {
         got,
         lines(&[
             "impersonator",
-            "--noproxy",
-            "*",
             "--impersonate",
             "chrome150",
             "https://example.com/",
@@ -674,8 +670,6 @@ fn the_marker_value_names_the_profile_over_the_environment() {
         got,
         lines(&[
             "impersonator",
-            "--noproxy",
-            "*",
             "--impersonate",
             "firefox147",
             "https://example.com/",
@@ -707,8 +701,6 @@ fn marked_invocation_keeps_only_the_callers_request_headers() {
         got,
         lines(&[
             "impersonator",
-            "--noproxy",
-            "*",
             "--impersonate",
             "chrome150",
             "-sS",

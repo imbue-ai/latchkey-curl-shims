@@ -787,12 +787,11 @@ fn resolve_impersonator() -> PathBuf {
     })
 }
 
-/// The argv handed to curl-impersonate for a marked invocation.
-///
-/// Two flags go in front. `--impersonate <profile>` is the whole point.
-/// `--noproxy '*'` keeps `HTTP(S)_PROXY` and the macOS proxy pane out of
-/// a request that carries the user's credentials — deliberately stricter
-/// than plain curl, which honors them.
+/// The argv handed to curl-impersonate for a marked invocation:
+/// `--impersonate <profile>` in front, which is the whole point. A proxy
+/// from the environment is honored, as the system curl honors it on every
+/// other route: Chrome on this machine would use it too, and a `CONNECT`
+/// tunnel carries the TLS fingerprint through untouched.
 ///
 /// The profile advertises `Accept-Encoding: gzip, deflate, br, zstd` as
 /// part of looking like Chrome, so the reply comes back compressed, and it
@@ -802,12 +801,8 @@ fn resolve_impersonator() -> PathBuf {
 /// gateway does) would frame it with the wrong length. Decoding belongs to
 /// the curl at the last hop, the caller's own: `latchkey curl --compressed`.
 fn impersonate_args(argv: &[String], profile: &str) -> Vec<String> {
-    let mut rewritten = Vec::with_capacity(argv.len() + 4);
-    rewritten.extend(
-        ["--noproxy", "*", "--impersonate", profile]
-            .into_iter()
-            .map(str::to_string),
-    );
+    let mut rewritten = Vec::with_capacity(argv.len() + 2);
+    rewritten.extend(["--impersonate", profile].into_iter().map(str::to_string));
     rewritten.extend(without_headers(argv, IMPERSONATE_STRIPPED_HEADERS));
     rewritten
 }
@@ -1549,8 +1544,6 @@ mod tests {
         assert_eq!(
             rewritten,
             argv(&[
-                "--noproxy",
-                "*",
                 "--impersonate",
                 "chrome150",
                 "-sS",
@@ -1600,13 +1593,7 @@ mod tests {
                 impersonate_args(&argv(&["-H", header, "https://example.com/"]), "chrome150");
             assert_eq!(
                 rewritten,
-                argv(&[
-                    "--noproxy",
-                    "*",
-                    "--impersonate",
-                    "chrome150",
-                    "https://example.com/",
-                ]),
+                argv(&["--impersonate", "chrome150", "https://example.com/",]),
                 "{header:?} survived"
             );
         }
@@ -1631,8 +1618,6 @@ mod tests {
         assert_eq!(
             rewritten,
             argv(&[
-                "--noproxy",
-                "*",
                 "--impersonate",
                 "chrome131",
                 "-H",
@@ -1651,14 +1636,7 @@ mod tests {
         let rewritten = impersonate_args(&argv(&["https://example.com/", "-H"]), "chrome150");
         assert_eq!(
             rewritten,
-            argv(&[
-                "--noproxy",
-                "*",
-                "--impersonate",
-                "chrome150",
-                "https://example.com/",
-                "-H",
-            ])
+            argv(&["--impersonate", "chrome150", "https://example.com/", "-H",])
         );
     }
 
